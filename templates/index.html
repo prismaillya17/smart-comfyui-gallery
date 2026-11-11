@@ -1325,6 +1325,7 @@ document.addEventListener('focusout', function(e) {
                 <button id="lightbox-help-btn" title="Menu Actions & Shortcuts (/)" style="font-size: 0.9rem; font-weight: bold; padding: 0 12px !important; min-width: auto !important; letter-spacing: 0.5px;">/&nbsp;MENU</button>
                 <button id="lightbox-zoom-out" title="Zoom Out">-</button>
                 <button id="lightbox-zoom-in" title="Zoom In">+</button>
+                <button id="lightbox-hd-btn" title="Load Lossless 4K Original (Shift+H)" onclick="toggleLightboxHd(event)" style="display:none; font-size:0.78rem; font-weight:800; padding:0 9px !important; min-width:auto !important; letter-spacing:0.3px;">4K</button>
                 <button id="lightbox-rotate-btn" title="Rotate Media (T)" onclick="rotateLightbox()">🔄</button>
                 {% if enable_ai_search %}
                 <button id="lightbox-index-btn" class="lb-hide-mobile" title="Force AI Re-Indexing" onclick="indexCurrentLightboxFile()" style="border-color:var(--ai-color); color:var(--ai-color);">⚡</button>
@@ -2098,6 +2099,7 @@ document.addEventListener('focusout', function(e) {
                 <button class="glass-btn" onclick="cmpZoom(-0.2)" title="Zoom Out (-)" style="min-width:35px; padding:0;">-</button>
                 <button class="glass-btn" onclick="cmpZoom(0.2)" title="Zoom In (+)" style="min-width:35px; padding:0;">+</button>
                 <button class="glass-btn" onclick="cmpResetZoom()" title="Reset (0)" style="font-size:0.85rem; padding:0 10px;">Original</button>
+                <button id="cmp-hd-btn" class="glass-btn" onclick="upgradeCompareToOriginal()" title="Load Lossless 4K Originals" style="display:none; font-size:0.8rem; font-weight:800; padding:0 10px;">4K</button>
                 
                 <button class="close-btn" onclick="closeCompareMode()" style="font-size:2rem; background:none; border:none; color:white; cursor:pointer; margin-left:5px;">×</button>
             </div>
@@ -3465,12 +3467,17 @@ document.addEventListener('focusout', function(e) {
                     if (data.status === 'no_changes') { 
                         if (isManualRefresh && !isSilent) { 
                             syncProgressFill.style.width = '100%'; 
-                            cleanupAndClose(true);
-                        } else {
-                            cleanupAndClose(false); 
                         }
+                        cleanupAndClose(false); 
                     } else if (data.status === 'reloading') { 
-                        cleanupAndClose(true); 
+                        const addedIds = data.added_ids || [];
+                        const removedIds = data.removed_ids || [];
+                        if (!silentRefreshShouldReload() && addedIds.length <= 500) {
+                            cleanupAndClose(false);
+                            applySilentDelta(addedIds, removedIds);
+                        } else {
+                            cleanupAndClose(true);
+                        }
                     } 
                 } catch (e) { 
                     console.error("Error parsing SSE data:", e); 
@@ -3651,6 +3658,80 @@ document.addEventListener('focusout', function(e) {
         
         function formatBytes(bytes, decimals = 1) { if (!bytes) return '0 B'; const k = 1024; const dm = decimals < 0 ? 0 : decimals; const sizes = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.floor(Math.log(bytes) / Math.log(k)); return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i]; }
         function appendFiles(files) { if (typeof resetClusterColorMap === 'function' && currentItemCount === 0) resetClusterColorMap(); if (!files || files.length === 0) { if (currentItemCount === 0) showEmptyState(); updateLoadMoreVisibility(); return; } const fragment = document.createDocumentFragment(); const newLazyElements = []; files.forEach(file => { allFilesData.push(file); const item = createGalleryItem(file); fragment.appendChild(item); galleryItems.push(item); const lazyEl = item.querySelector('.lazy'); if (lazyEl) newLazyElements.push(lazyEl); }); galleryContainer.appendChild(fragment); initializeLazyLoading(newLazyElements); currentItemCount += files.length; updateLoadMoreVisibility(); }
+        function silentRefreshShouldReload() {
+            const p = new URLSearchParams(window.location.search);
+            const blockers = ['search','workflow_files','workflow_prompt','comment_search','start_date','end_date','extension','prefix','rated_by','rating_range','favorites','no_workflow','no_ai_caption','ai_session_id','omniquery_id','cluster_mode'];
+            for (const key of blockers) {
+                if (p.get(key)) return true;
+            }
+            if ((p.get('scope') || '') === 'global') return true;
+            if ((p.get('sort_by') || 'date') !== 'date') return true;
+            if ((p.get('sort_order') || 'desc') !== 'desc') return true;
+            return false;
+        }
+        function prependFiles(files) {
+            if (!files || files.length === 0) return 0;
+            const existing = new Set(allFilesData.map(f => f.id));
+            files = files.filter(f => f && f.id && !existing.has(f.id));
+            if (files.length === 0) return 0;
+            const empty = galleryContainer.querySelector('.empty-state');
+            if (empty) empty.remove();
+            const fragment = document.createDocumentFragment();
+            const newLazyElements = [];
+            const items = [];
+            files.forEach(file => {
+                const item = createGalleryItem(file);
+                fragment.appendChild(item);
+                items.push(item);
+                const lazyEl = item.querySelector('.lazy');
+                if (lazyEl) newLazyElements.push(lazyEl);
+            });
+            galleryContainer.insertBefore(fragment, galleryContainer.firstChild);
+            allFilesData = files.concat(allFilesData);
+            galleryItems = items.concat(galleryItems);
+            if (focusedItemIndex >= 0) focusedItemIndex += files.length;
+            initializeLazyLoading(newLazyElements);
+            currentItemCount += files.length;
+            totalFiles += files.length;
+            totalFolderFiles += files.length;
+            updateLoadMoreVisibility();
+            updateFileCountBadge();
+            return files.length;
+        }
+        function removeFilesByIds(ids) {
+            if (!ids || ids.length === 0) return;
+            const drop = new Set(ids);
+            let domRemoved = 0;
+            drop.forEach(id => {
+                const el = galleryContainer.querySelector(`.gallery-item[data-file-id="${id}"]`);
+                if (el) { el.remove(); domRemoved++; }
+            });
+            allFilesData = allFilesData.filter(f => !drop.has(f.id));
+            galleryItems = galleryItems.filter(el => el.isConnected);
+            currentItemCount = Math.max(0, currentItemCount - domRemoved);
+            totalFiles = Math.max(0, totalFiles - drop.size);
+            totalFolderFiles = Math.max(0, totalFolderFiles - drop.size);
+            if (focusedItemIndex >= galleryItems.length) focusedItemIndex = galleryItems.length - 1;
+            updateLoadMoreVisibility();
+            updateFileCountBadge();
+            if (currentItemCount === 0) showEmptyState();
+        }
+        function applySilentDelta(addedIds, removedIds) {
+            const p = new URLSearchParams(window.location.search);
+            fetch('/galleryout/api/files_brief', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    ids: addedIds || [],
+                    removed_ids: removedIds || [],
+                    sort_by: p.get('sort_by') || 'date',
+                    sort_order: p.get('sort_order') || 'desc'
+                })
+            }).then(r => r.json()).then(data => {
+                if (removedIds && removedIds.length) removeFilesByIds(removedIds);
+                prependFiles((data && data.files) || []);
+            }).catch(() => { window.location.reload(); });
+        }
         function createGalleryItem(file) {
             const item = document.createElement('div');
             item.className = `gallery-item ${selectedFiles.has(file.id) ? 'selected' : ''}`;
@@ -3674,7 +3755,8 @@ document.addEventListener('focusout', function(e) {
             if (file.type === 'audio') {
                 mediaHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:4rem;color:#1ed760;">🎵</div>`;
             } else if (['image', 'animated_image'].includes(file.type)) {
-                mediaHTML = `<img class="lazy" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3C/svg%3E" data-src="/galleryout/thumbnail/${file.id}" alt="${file.name}" loading="lazy">`;
+                const thumbVer = Math.floor(file.mtime || 0);
+                mediaHTML = `<img class="lazy" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3C/svg%3E" data-src="/galleryout/thumbnail/${file.id}?v=${thumbVer}" alt="${file.name}" loading="lazy" decoding="async">`;
             } else if (file.type === 'document') {
                 mediaEl = document.createElement('div');
                 mediaEl.className = 'theater-document-reader';
@@ -3721,7 +3803,7 @@ document.addEventListener('focusout', function(e) {
                 mediaHTML = `
                     <video ${vidAttrs} loop playsinline class="lazy" 
                         data-src="${videoSource}" 
-                        poster="/galleryout/thumbnail/${file.id}"></video>
+                        poster="/galleryout/thumbnail/${file.id}?v=${Math.floor(file.mtime || 0)}"></video>
                     ${overlayHTML}
                 `;
             } else if (file.type === 'document') {
@@ -4918,8 +5000,147 @@ document.addEventListener('focusout', function(e) {
             }, 60000); // Disappear after 60 secs if ignored
         }
         const lightboxOverlay = document.getElementById('lightbox-overlay'); const lightboxMedia = document.getElementById('lightbox-media'); const lightboxTitle = document.getElementById('lightbox-title'); const lightboxDownload = document.getElementById('lightbox-download'); const lightboxWorkflow = document.getElementById('lightbox-workflow'); const lightboxNewTab = document.getElementById('lightbox-new-tab'); const lightboxAiCaption = document.getElementById('lightbox-ai-caption'); let currentLightboxIndex = -1; let currentLightboxFile = null; let currentZoom = 1; let currentTranslateX = 0; let currentTranslateY = 0; let panStep = 50; let currentRotation = 0;
-        function updateLightboxTitle() { if (!currentLightboxFile) return; const zoomPercentage = Math.round(currentZoom * 100); lightboxTitle.textContent = `${currentLightboxFile.name} (Scale: ${zoomPercentage}%)`; }
-        function updateMediaTransform() { const mediaEl = lightboxMedia.querySelector('img, video'); if (!mediaEl) return; mediaEl.style.transform = `translate(${currentTranslateX}px, ${currentTranslateY}px) scale(${currentZoom}) rotate(${currentRotation}deg)`; updateLightboxTitle(); }
+        const PREVIEW_MIN_BYTES_CLIENT = 4 * 1024 * 1024;
+        const PREVIEW_MAX_DIM_CLIENT = 2048;
+
+        function fileNeedsPreview(file) {
+            if (!file || file.type !== 'image') return false;
+            if ((file.size || 0) >= PREVIEW_MIN_BYTES_CLIENT) return true;
+            if (file.dimensions && file.dimensions.indexOf('x') !== -1) {
+                const parts = file.dimensions.split('x');
+                const w = parseInt(parts[0], 10) || 0;
+                const h = parseInt(parts[1], 10) || 0;
+                if (Math.max(w, h) > PREVIEW_MAX_DIM_CLIENT) return true;
+            }
+            return false;
+        }
+
+        function getPreviewOrFileUrl(file, forceOriginal = false) {
+            if (!file) return '';
+            if (!forceOriginal && fileNeedsPreview(file)) {
+                return `/galleryout/preview/${file.id}?v=${Math.floor(file.mtime || 0)}`;
+            }
+            return `/galleryout/file/${file.id}`;
+        }
+
+        function abortContainerMediaLoads(container) {
+            if (window._lbPendingPrevImg) {
+                window._lbPendingPrevImg.onload = null;
+                window._lbPendingPrevImg.onerror = null;
+                window._lbPendingPrevImg.src = '';
+                window._lbPendingPrevImg = null;
+            }
+            if (window._lbPendingHdImg) {
+                window._lbPendingHdImg.onload = null;
+                window._lbPendingHdImg.onerror = null;
+                window._lbPendingHdImg.src = '';
+                window._lbPendingHdImg = null;
+            }
+            if (window._lbPreloadTimer) {
+                clearTimeout(window._lbPreloadTimer);
+                window._lbPreloadTimer = null;
+            }
+            if (!container) return;
+            container.querySelectorAll('img, video, audio').forEach(el => {
+                el.onload = null;
+                el.onerror = null;
+                el.onloadeddata = null;
+                try { if (el.pause) el.pause(); } catch (_) {}
+                el.removeAttribute('src');
+                el.src = '';
+                try { if (el.load) el.load(); } catch (_) {}
+            });
+        }
+
+        function syncLightboxHdButtonUI() {
+            const hdBtn = document.getElementById('lightbox-hd-btn');
+            if (!hdBtn) return;
+            if (!currentLightboxFile || !fileNeedsPreview(currentLightboxFile)) {
+                hdBtn.style.display = 'none';
+                return;
+            }
+            hdBtn.style.display = 'flex';
+            if (window._lbHdLoading) {
+                hdBtn.textContent = '⏳ 4K';
+                hdBtn.style.color = '#00e5ff';
+                hdBtn.style.borderColor = '#00e5ff';
+                hdBtn.title = 'Loading lossless 4K original...';
+            } else if (window._lbHdLoaded) {
+                hdBtn.textContent = '✨ 4K';
+                hdBtn.style.color = 'var(--success-color)';
+                hdBtn.style.borderColor = 'var(--success-color)';
+                hdBtn.title = 'Viewing lossless 4K original';
+            } else {
+                hdBtn.textContent = '4K';
+                hdBtn.style.color = 'var(--text-muted)';
+                hdBtn.style.borderColor = 'rgba(255,255,255,0.25)';
+                hdBtn.title = 'Fast 2K Preview active — Click or Zoom in (Shift+H) to load lossless 4K original';
+            }
+        }
+
+        function upgradeLightboxToOriginal(silentAuto = false) {
+            if (!currentLightboxFile || !fileNeedsPreview(currentLightboxFile)) return;
+            if (window._lbHdLoaded || window._lbHdLoading) return;
+            const mediaEl = lightboxMedia.querySelector('img');
+            if (!mediaEl) return;
+
+            const activeToken = window._lbActiveToken;
+            window._lbHdLoading = true;
+            syncLightboxHdButtonUI();
+
+            const hdImg = new Image();
+            hdImg.decoding = 'async';
+            window._lbPendingHdImg = hdImg;
+            hdImg.onload = () => {
+                if (window._lbActiveToken !== activeToken) return;
+                window._lbPendingHdImg = null;
+                window._lbHdLoading = false;
+                window._lbHdLoaded = true;
+                mediaEl.src = hdImg.src;
+                mediaEl.style.filter = '';
+                syncLightboxHdButtonUI();
+                updateLightboxTitle();
+                if (!silentAuto && typeof showNotification === 'function') {
+                    showNotification('✨ Loaded lossless 4K original', 'success', 1800);
+                }
+            };
+            hdImg.onerror = () => {
+                if (window._lbActiveToken !== activeToken) return;
+                window._lbPendingHdImg = null;
+                window._lbHdLoading = false;
+                syncLightboxHdButtonUI();
+            };
+            hdImg.src = `/galleryout/file/${currentLightboxFile.id}`;
+        }
+
+        function toggleLightboxHd(event) {
+            if (event && event.stopPropagation) event.stopPropagation();
+            if (!currentLightboxFile || !fileNeedsPreview(currentLightboxFile)) return;
+            if (!window._lbHdLoaded) {
+                upgradeLightboxToOriginal(false);
+            }
+        }
+
+        function scheduleLightboxNeighborPreload(centerIndex, token) {
+            if (window._lbPreloadTimer) clearTimeout(window._lbPreloadTimer);
+            window._lbPreloadTimer = setTimeout(() => {
+                if (window._lbActiveToken !== token || !document.body.classList.contains('lightbox-open')) return;
+                [1, -1].forEach(offset => {
+                    const nIdx = (centerIndex + offset + galleryItems.length) % galleryItems.length;
+                    if (nIdx === centerIndex || !galleryItems[nIdx]) return;
+                    const nId = galleryItems[nIdx].dataset.fileId;
+                    const nFile = allFilesData.find(f => f.id === nId);
+                    if (nFile && nFile.type === 'image') {
+                        const pre = new Image();
+                        pre.decoding = 'async';
+                        pre.src = getPreviewOrFileUrl(nFile, false);
+                    }
+                });
+            }, 120);
+        }
+
+        function updateLightboxTitle() { if (!currentLightboxFile) return; const zoomPercentage = Math.round(currentZoom * 100); const tierSuffix = (fileNeedsPreview(currentLightboxFile) && window._lbHdLoaded) ? ' · 4K' : ''; lightboxTitle.textContent = `${currentLightboxFile.name} (Scale: ${zoomPercentage}%${tierSuffix})`; }
+        function updateMediaTransform() { const mediaEl = lightboxMedia.querySelector('img, video'); if (!mediaEl) return; mediaEl.style.transform = `translate(${currentTranslateX}px, ${currentTranslateY}px) scale(${currentZoom}) rotate(${currentRotation}deg)`; if (currentZoom >= 1.8 && currentLightboxFile && fileNeedsPreview(currentLightboxFile) && !window._lbHdLoaded && !window._lbHdLoading) { upgradeLightboxToOriginal(true); } updateLightboxTitle(); }
         function rotateLightbox() { currentRotation = (currentRotation + 90) % 360; updateMediaTransform(); }
         
         function openLightbox(event, fileId, forceOpen = false) { 
@@ -4990,9 +5211,14 @@ document.addEventListener('focusout', function(e) {
             document.body.classList.remove('lightbox-open');
             if(typeof updateFocusStatusBar === 'function') updateFocusStatusBar();
             lightboxOverlay.classList.remove('visible');
+            window._lbActiveToken = (window._lbActiveToken || 0) + 1;
+            abortContainerMediaLoads(lightboxMedia);
             lightboxMedia.innerHTML = '';
             currentLightboxIndex = -1;
             currentLightboxFile = null;
+            window._lbHdLoaded = false;
+            window._lbHdLoading = false;
+            syncLightboxHdButtonUI();
         }
         
         // --- LIGHTBOX HELP LOGIC ---
@@ -5111,17 +5337,23 @@ document.addEventListener('focusout', function(e) {
             // Apply final HTML
             lightboxFolderEl.innerHTML = metaHtml;
             
-            // Clear the container and reset rotation
+            // Abort any in-flight 4K/preview/video transfers from previous item before clearing container
+            window._lbActiveToken = (window._lbActiveToken || 0) + 1;
+            const activeToken = window._lbActiveToken;
+            abortContainerMediaLoads(lightboxMedia);
             lightboxMedia.innerHTML = '';
             currentRotation = 0;
             // Hide caption by default when changing images
             toggleAiCaption(false);
             if(typeof closeRemixModal === 'function') closeRemixModal();
             if(window.hideCustomPlayer) window.hideCustomPlayer();
-            if(window.hideCustomPlayer) window.hideCustomPlayer();
             
             let mediaEl;
             const isImage = ['image', 'animated_image'].includes(file.type);
+            const usePreview = fileNeedsPreview(file);
+            window._lbHdLoaded = !usePreview;
+            window._lbHdLoading = false;
+            syncLightboxHdButtonUI();
 
             // Create element based on type
             if (file.type === 'audio') {
@@ -5132,8 +5364,65 @@ document.addEventListener('focusout', function(e) {
                 lightboxMedia.innerHTML = '<div style="font-size: 8rem; color: var(--text-muted); display:flex; align-items:center; justify-content:center; width:100%; height:100%; position:absolute; top:0; left:0; z-index:-1;">🎵</div>';
             } else if (isImage) {
                 mediaEl = document.createElement('img');
-                mediaEl.src = `/galleryout/file/${file.id}`;
+                mediaEl.decoding = 'async';
                 mediaEl.alt = file.name;
+                if (usePreview) {
+                    const previewUrl = getPreviewOrFileUrl(file, false);
+                    const prevLoader = new Image();
+                    prevLoader.decoding = 'async';
+                    prevLoader.src = previewUrl;
+
+                    if (prevLoader.complete && prevLoader.naturalWidth > 0) {
+                        mediaEl.src = previewUrl;
+                        scheduleLightboxNeighborPreload(index, activeToken);
+                    } else {
+                        mediaEl.src = `/galleryout/thumbnail/${file.id}?v=${Math.floor(file.mtime || 0)}`;
+                        if (file.dimensions && file.dimensions.indexOf('x') !== -1) {
+                            const [dw, dh] = file.dimensions.split('x').map(n => parseInt(n, 10) || 0);
+                            if (dw > 0 && dh > 0) {
+                                mediaEl.style.aspectRatio = `${dw} / ${dh}`;
+                                if (dh >= dw) {
+                                    mediaEl.style.height = '80vh';
+                                    mediaEl.style.width = 'auto';
+                                } else {
+                                    mediaEl.style.width = 'min(95vw, calc(80vh * ' + (dw / dh).toFixed(4) + '))';
+                                    mediaEl.style.height = 'auto';
+                                }
+                            }
+                        }
+                        mediaEl.style.filter = 'blur(2px)';
+                        window._lbPendingPrevImg = prevLoader;
+                        prevLoader.onload = () => {
+                            if (window._lbActiveToken !== activeToken) return;
+                            window._lbPendingPrevImg = null;
+                            mediaEl.style.aspectRatio = '';
+                            mediaEl.style.width = '';
+                            mediaEl.style.height = '';
+                            mediaEl.style.filter = '';
+                            if (!window._lbHdLoaded) {
+                                mediaEl.src = prevLoader.src;
+                            }
+                            const loader = lightboxMedia.querySelector('.lightbox-loader');
+                            if (loader) loader.remove();
+                            mediaEl.style.opacity = '1';
+                            updateMediaTransform();
+                            scheduleLightboxNeighborPreload(index, activeToken);
+                        };
+                        prevLoader.onerror = () => {
+                            if (window._lbActiveToken !== activeToken) return;
+                            window._lbPendingPrevImg = null;
+                            mediaEl.style.aspectRatio = '';
+                            mediaEl.style.width = '';
+                            mediaEl.style.height = '';
+                            mediaEl.style.filter = '';
+                            mediaEl.src = `/galleryout/file/${file.id}`;
+                            window._lbHdLoaded = true;
+                            syncLightboxHdButtonUI();
+                        };
+                    }
+                } else {
+                    mediaEl.src = `/galleryout/file/${file.id}`;
+                }
             } else if (file.type === 'document') {
                 mediaEl = document.createElement('div');
                 mediaEl.className = 'theater-document-reader';
@@ -5153,16 +5442,7 @@ document.addEventListener('focusout', function(e) {
                 mediaEl = document.createElement('video');
                 
                 const lowerName = file.name.toLowerCase();
-                
-                // LOGIC: NATIVE vs STREAMING
-                // Browsers natively support: .mp4 (h264), .webm
-                // Browsers FAIL on: .mkv, .avi, .mov (ProRes/HEVC), .wmv, .flv
-                // We force streaming for ANY container that isn't strictly standard mp4/webm
-                // or if it's a "heavy" file (streamThresholdBytes).
-                
                 const isNativeContainer = lowerName.endsWith('.mp4') || lowerName.endsWith('.webm');
-                
-                // PATCHED: Native formats bypass stream to allow full duration tracking
                 let useStream = !isNativeContainer;
                 if (lowerName.endsWith('.mov')) {
                     useStream = true;
@@ -5185,12 +5465,19 @@ document.addEventListener('focusout', function(e) {
                     if (loader) loader.remove();
                     mediaEl.style.opacity = '1';
                     updateMediaTransform();
+                    if (isImage && !usePreview) {
+                        scheduleLightboxNeighborPreload(index, activeToken);
+                    }
                 };
 
                 if (file.type === 'document' || (isImage && mediaEl.complete)) {
+                    if (isImage && window.hideCustomPlayer) window.hideCustomPlayer();
                     mediaEl.style.opacity = '1'; 
                     lightboxMedia.appendChild(mediaEl);
                     updateMediaTransform();
+                    if (isImage && !usePreview) {
+                        scheduleLightboxNeighborPreload(index, activeToken);
+                    }
                 } 
                 else {
                     const loader = document.createElement('div');
@@ -7935,7 +8222,7 @@ document.addEventListener('focusout', function(e) {
                         case '9': panLightbox(-panStep, panStep); break;
                         case '1': panLightbox(panStep, -panStep); break;
                         case '3': panLightbox(-panStep, -panStep); break;
-                        case 'h': case 'H': toggleLightboxUi(); break;
+                        case 'h': case 'H': if (e.shiftKey) { toggleLightboxHd(e); } else { toggleLightboxUi(); } break;
                         case '?': showShortcutsHelp(); break;
                         case 'e': case 'E': if(currentLightboxFile) openStoryboard(currentLightboxFile.id); break;
                         case '/': openLightboxHelp(); break;
@@ -9877,6 +10164,11 @@ document.addEventListener('focusout', function(e) {
             document.getElementById('compare-overlay').classList.add('visible');
             document.body.classList.add('modal-open');
 
+            cmpState.needsHd = fileNeedsPreview(fileA) || fileNeedsPreview(fileB);
+            cmpState.hdLoaded = !cmpState.needsHd;
+            cmpState.hdLoading = false;
+            syncCompareHdButtonUI();
+
             // 1. Render Media (Dynamic: Video or Image)
             const elA = renderCmpMedia(fileA, 'cmp-container-a', 'cmp-media-a');
             const elB = renderCmpMedia(fileB, 'cmp-container-b', 'cmp-media-b');
@@ -9891,18 +10183,71 @@ document.addEventListener('focusout', function(e) {
             loadCmpDiffData(fileA.id, fileB.id);
         }
 
+        function syncCompareHdButtonUI() {
+            const btn = document.getElementById('cmp-hd-btn');
+            if (!btn) return;
+            if (!cmpState.needsHd) {
+                btn.style.display = 'none';
+                return;
+            }
+            btn.style.display = 'inline-flex';
+            if (cmpState.hdLoading) {
+                btn.textContent = '⏳ 4K';
+                btn.style.color = '#00e5ff';
+                btn.style.borderColor = '#00e5ff';
+            } else if (cmpState.hdLoaded) {
+                btn.textContent = '✨ 4K';
+                btn.style.color = 'var(--success-color)';
+                btn.style.borderColor = 'var(--success-color)';
+            } else {
+                btn.textContent = '4K';
+                btn.style.color = '';
+                btn.style.borderColor = '';
+            }
+        }
+
+        function upgradeCompareToOriginal() {
+            if (!cmpState.active || !cmpState.needsHd || cmpState.hdLoaded || cmpState.hdLoading) return;
+            cmpState.hdLoading = true;
+            syncCompareHdButtonUI();
+            const tasks = [];
+            [['cmp-media-a', cmpState.fileA], ['cmp-media-b', cmpState.fileB]].forEach(([elId, f]) => {
+                const el = document.getElementById(elId);
+                if (el && el.tagName === 'IMG' && f && fileNeedsPreview(f)) {
+                    tasks.push(new Promise(resolve => {
+                        const img = new Image();
+                        img.decoding = 'async';
+                        img.onload = () => { if (cmpState.active) el.src = img.src; resolve(); };
+                        img.onerror = () => resolve();
+                        img.src = `/galleryout/file/${f.id}`;
+                    }));
+                }
+            });
+            Promise.all(tasks).then(() => {
+                if (!cmpState.active) return;
+                cmpState.hdLoading = false;
+                cmpState.hdLoaded = true;
+                syncCompareHdButtonUI();
+            });
+        }
+
         function closeCompareMode() {
             document.getElementById('compare-overlay').classList.remove('visible');
             document.body.classList.remove('modal-open');
             cmpState.active = false;
-            // Clear containers to stop videos
-            document.getElementById('cmp-container-a').innerHTML = '';
-            document.getElementById('cmp-container-b').innerHTML = '';
+            cmpState.hdLoading = false;
+            const cA = document.getElementById('cmp-container-a');
+            const cB = document.getElementById('cmp-container-b');
+            abortContainerMediaLoads(cA);
+            abortContainerMediaLoads(cB);
+            if (cA) cA.innerHTML = '';
+            if (cB) cB.innerHTML = '';
         }
 
         // Helper: Creates <img> or <video> dynamically
         function renderCmpMedia(file, containerId, elementId) {
             const container = document.getElementById(containerId);
+            abortContainerMediaLoads(container);
             container.innerHTML = ''; 
             
             let el;
@@ -9913,7 +10258,8 @@ document.addEventListener('focusout', function(e) {
                 el.controls = false;
             } else {
                 el = document.createElement('img');
-                el.src = `/galleryout/file/${file.id}`;
+                el.decoding = 'async';
+                el.src = getPreviewOrFileUrl(file, false);
             }
             
             el.id = elementId;
@@ -9957,6 +10303,9 @@ document.addEventListener('focusout', function(e) {
             const elB = document.getElementById('cmp-media-b');
             if(elA) elA.style.transform = transform;
             if(elB) elB.style.transform = transform;
+            if (cmpState.zoom >= 1.8 && cmpState.needsHd && !cmpState.hdLoaded && !cmpState.hdLoading) {
+                upgradeCompareToOriginal();
+            }
         }
 
         function updateCmpSlider() {

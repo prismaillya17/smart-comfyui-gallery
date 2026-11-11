@@ -189,6 +189,12 @@ SERVER_PORT = int(os.environ.get('SERVER_PORT', 8189))
 # Width (in pixels) of the generated thumbnails.
 THUMBNAIL_WIDTH = int(os.environ.get('THUMBNAIL_WIDTH', 300))
 
+# Maximum long-edge dimension (px) and size threshold (bytes) for Scheme B mid-res Lightbox/Compare previews.
+PREVIEW_MAX_DIM = int(os.environ.get('PREVIEW_MAX_DIM', 2048))
+PREVIEW_MIN_BYTES = int(os.environ.get('PREVIEW_MIN_BYTES', 4 * 1024 * 1024))
+WAITRESS_THREADS = int(os.environ.get('WAITRESS_THREADS', 24))
+SYNC_MAX_WORKERS = int(os.environ.get('SYNC_MAX_WORKERS', 4))
+
 
 # Assumed frame rate for animated WebP files.  
 # Many tools, including ComfyUI, generate WebP animations at ~16 FPS.  
@@ -334,6 +340,7 @@ COMFYUI_SERVER_URL = os.environ.get('COMFYUI_SERVER_URL', 'http://127.0.0.1:8188
 
 # --- CACHE AND FOLDER NAMES ---
 THUMBNAIL_CACHE_FOLDER_NAME = '.thumbnails_cache'
+PREVIEW_CACHE_FOLDER_NAME = '.previews_cache'
 SQLITE_CACHE_FOLDER_NAME = '.sqlite_cache'
 DATABASE_FILENAME = 'gallery_cache.sqlite'
 ZIP_CACHE_FOLDER_NAME = '.zip_downloads'
@@ -410,6 +417,7 @@ DB_SCHEMA_VERSION = 32
 # sidecars in an external cache directory are no longer read or written and may
 # be removed manually.
 THUMBNAIL_CACHE_DIR = os.path.join(BASE_SMARTGALLERY_PATH, THUMBNAIL_CACHE_FOLDER_NAME)
+PREVIEW_CACHE_DIR = os.path.join(BASE_SMARTGALLERY_PATH, PREVIEW_CACHE_FOLDER_NAME)
 
 SQLITE_CACHE_DIR = os.path.join(BASE_SMARTGALLERY_PATH, SQLITE_CACHE_FOLDER_NAME)
 # Directory for metadata-stripped files (for client delivery)
@@ -1272,47 +1280,168 @@ def _validate_and_get_workflow(json_string):
 
     return None, None
 
+_STRUCTURED_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif', '.gif'}
+_MAX_WORKFLOW_CANDIDATE_CHARS = 8 * 1024 * 1024
+
 def _scan_bytes_for_workflow(content_bytes):
     """
-    Generator that yields all valid JSON objects found in the byte stream.
-    Searches for matching curly braces.
+    Generator that yields valid ComfyUI workflow JSON objects found in content_bytes.
+    Uses a C-level byte pre-check so non-workflow binary media (e.g. 4K PNGs) exits in <1ms
+    without decoding megabytes of pixel data or holding the Python GIL.
     """
+    if not content_bytes or (b'"nodes"' not in content_bytes and b'"class_type"' not in content_bytes):
+        return
     try:
         stream_str = content_bytes.decode('utf-8', errors='ignore')
     except Exception:
         return
 
+    n = len(stream_str)
     start_pos = 0
-    while True:
+    while start_pos < n:
         first_brace = stream_str.find('{', start_pos)
         if first_brace == -1:
             break
-        
+
         open_braces = 0
-        start_index = first_brace
-        
-        for i in range(start_index, len(stream_str)):
+        in_string = False
+        escape = False
+        end_limit = min(n, first_brace + _MAX_WORKFLOW_CANDIDATE_CHARS)
+        matched_end = -1
+
+        for i in range(first_brace, end_limit):
             char = stream_str[i]
-            if char == '{':
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == '\\':
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == '{':
                 open_braces += 1
             elif char == '}':
                 open_braces -= 1
-            
-            if open_braces == 0:
-                candidate = stream_str[start_index : i + 1]
-                # FIX: Use 'except Exception' to allow GeneratorExit to pass through
+                if open_braces == 0:
+                    matched_end = i
+                    break
+
+        if matched_end != -1:
+            candidate = stream_str[first_brace : matched_end + 1]
+            if '"nodes"' in candidate or '"class_type"' in candidate:
                 try:
                     json.loads(candidate)
                     yield candidate
                 except Exception:
                     pass
-                
-                # Move start_pos to after this candidate to find the next one
-                start_pos = i + 1
-                break
+            start_pos = matched_end + 1
         else:
-            # If loop finishes without open_braces hitting 0, no more valid JSON here
-            break
+            start_pos = first_brace + 1
+
+def _read_head_tail_bytes(filepath, window=262144):
+    """Reads at most `window` bytes from file head and tail without touching multi-MB pixel bodies."""
+    chunks = []
+    try:
+        with open(filepath, 'rb') as f:
+            head = f.read(window)
+            if head:
+                chunks.append(head)
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size > window:
+                tail_start = max(window, size - window)
+                f.seek(tail_start, os.SEEK_SET)
+                tail = f.read(window)
+                if tail:
+                    chunks.append(tail)
+    except Exception:
+        pass
+    return chunks
+
+def _extract_workflows_from_pil_image(img):
+    """Extracts {'ui': ..., 'api': ...} workflows from an already-opened PIL.Image without re-opening disk files."""
+    found = {}
+
+    def analyze_json(json_str):
+        if not json_str:
+            return
+        if isinstance(json_str, bytes):
+            if b'"nodes"' not in json_str and b'"class_type"' not in json_str:
+                return
+            json_str = json_str.decode('utf-8', errors='ignore')
+        elif isinstance(json_str, str):
+            if '"nodes"' not in json_str and '"class_type"' not in json_str:
+                return
+        else:
+            return
+        wf, wf_type = _validate_and_get_workflow(json_str)
+        if wf and wf_type and wf_type not in found:
+            found[wf_type] = wf
+
+    info = getattr(img, 'info', None) or {}
+    for key in ('workflow', 'prompt', 'Comment', 'Description', 'UserComment'):
+        val = info.get(key)
+        if val:
+            analyze_json(val)
+
+    if len(found) < 2:
+        for key, val in info.items():
+            if key in ('workflow', 'prompt', 'exif', 'icc_profile'):
+                continue
+            if isinstance(val, (str, bytes)):
+                analyze_json(val)
+
+    exif_data = info.get('exif')
+    if exif_data and isinstance(exif_data, bytes) and (b'"nodes"' in exif_data or b'"class_type"' in exif_data):
+        try:
+            exif_str = exif_data.decode('utf-8', errors='ignore')
+            if 'workflow:{' in exif_str:
+                start = exif_str.find('workflow:{') + len('workflow:')
+                for json_candidate in _scan_bytes_for_workflow(exif_str[start:].encode('utf-8')):
+                    analyze_json(json_candidate)
+        except Exception:
+            pass
+        if len(found) < 2:
+            for json_str in _scan_bytes_for_workflow(exif_data):
+                analyze_json(json_str)
+
+    return found
+
+def _is_file_still_writing(filepath, file_size=None, mtime=None):
+    """
+    Detects large PNG/JPEG files that are still actively flushing to disk (e.g. 25-48MB 4K PNGs from ComfyUI/Minimax).
+    Prevents premature half-file decoding and broken grey thumbnails during live folder sync.
+    """
+    try:
+        if file_size is None or mtime is None:
+            st = os.stat(filepath)
+            file_size, mtime = st.st_size, st.st_mtime
+        if file_size <= 0:
+            return True
+        age = time.time() - mtime
+        if not (-30.0 <= age < 10.0):
+            return False
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == '.png':
+            if file_size < 57:
+                return True
+            with open(filepath, 'rb') as f:
+                f.seek(max(0, file_size - 4096), os.SEEK_SET)
+                tail = f.read(4096)
+            return b'IEND\xaeB`\x82' not in tail
+        elif ext in ('.jpg', '.jpeg') and age < 5.0:
+            if file_size < 4:
+                return True
+            with open(filepath, 'rb') as f:
+                f.seek(max(0, file_size - 512), os.SEEK_SET)
+                tail = f.read(512)
+            return b'\xff\xd9' not in tail
+    except OSError:
+        return True
+    return False
             
 def extract_workflow(filepath, target_type='ui'):
     """
@@ -1354,38 +1483,27 @@ def extract_workflow(filepath, target_type='ui'):
     else:
         try:
             with Image.open(filepath) as img:
-                # Check standard keys
-                for key in ['workflow', 'prompt']:
-                    val = img.info.get(key)
-                    if val: analyze_json(val)
-
-                # Check Exif/UserComment (for WebP/JPG)
-                exif_data = img.info.get('exif')
-                if exif_data and isinstance(exif_data, bytes):
-                    try:
-                        exif_str = exif_data.decode('utf-8', errors='ignore')
-                        # Fast path: check for workflow marker
-                        if 'workflow:{' in exif_str:
-                            start = exif_str.find('workflow:{') + len('workflow:')
-                            for json_candidate in _scan_bytes_for_workflow(exif_str[start:].encode('utf-8')):
-                                analyze_json(json_candidate)
-                    except Exception: pass
-                    
-                    # Full scan fallback
-                    for json_str in _scan_bytes_for_workflow(exif_data):
-                        analyze_json(json_str)
+                found_workflows.update(_extract_workflows_from_pil_image(img))
         except Exception: pass
 
-    # Raw byte scan (ultimate fallback)
+    # Bounded fallback scan: never read tens of MBs of compressed pixel streams for structured image files
     if not found_workflows:
-        try:
-            with open(filepath, 'rb') as f:
-                content = f.read()
-            for json_str in _scan_bytes_for_workflow(content):
-                analyze_json(json_str)
-                # Optimization: Stop if we found what we wanted
-                if target_type in found_workflows: break
-        except Exception: pass
+        if ext in _STRUCTURED_IMAGE_EXTS:
+            for chunk in _read_head_tail_bytes(filepath, 262144):
+                for json_str in _scan_bytes_for_workflow(chunk):
+                    analyze_json(json_str)
+                    if target_type in found_workflows:
+                        break
+                if target_type in found_workflows:
+                    break
+        else:
+            try:
+                with open(filepath, 'rb') as f:
+                    content = f.read()
+                for json_str in _scan_bytes_for_workflow(content):
+                    analyze_json(json_str)
+                    if target_type in found_workflows: break
+            except Exception: pass
                 
     # Return Logic:
     # 1. Return the requested type if found
@@ -1585,8 +1703,6 @@ def format_duration(seconds):
 def analyze_file_metadata(filepath):
     details = {'type': 'unknown', 'duration': '', 'dimensions': '', 'has_workflow': 0}
     ext_lower = os.path.splitext(filepath)[1].lower()
-    #https://aistudio.google.com/prompts/1uYTqxN6LAJZucWaoD5DlOlljhj0eB1uY#:~:text=function%20showItemAtIndex(index) = {'.png': 'image', '.jpg': 'image', '.jpeg': 'image', '.gif': 'animated_image', '.mp4': 'video', '.webm': 'video', '.mov': 'video', '.mp3': 'audio', '.wav': 'audio', '.ogg': 'audio', '.flac': 'audio'}
-    # Extended Type Map for Professional Formats
     type_map = {
         # Images
         '.png': 'image', '.jpg': 'image', '.jpeg': 'image', 
@@ -1603,58 +1719,75 @@ def analyze_file_metadata(filepath):
         '.txt': 'document', '.md': 'document'
     }
     details['type'] = type_map.get(ext_lower, 'unknown')
-    if details['type'] == 'unknown' and ext_lower == '.webp': details['type'] = 'animated_image' if is_webp_animated(filepath) else 'image'
-    if 'image' in details['type']:
-        try:
-            with Image.open(filepath) as img: details['dimensions'] = f"{img.width}x{img.height}"
-        except Exception: pass
-    if extract_workflow(filepath): details['has_workflow'] = 1
     total_duration_sec = 0
-    if details['type'] == 'video':
+
+    if ext_lower in _STRUCTURED_IMAGE_EXTS:
+        # Single Image.open() pass: reads lazy header for dimensions, animation, duration, and embedded workflows
+        # without decoding 4K pixel streams or re-opening the file on NAS storage.
+        found_wfs = {}
         try:
-            cap = cv2.VideoCapture(filepath)
-            if cap.isOpened():
-                fps, count = cap.get(cv2.CAP_PROP_FPS), cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                if fps > 0 and count > 0: total_duration_sec = count / fps
-                details['dimensions'] = f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
-                cap.release()
-        except Exception: pass
-    elif details['type'] == 'audio':
-
-        current_ffprobe = FFPROBE_EXECUTABLE_PATH or find_ffprobe_path()
-
-        if current_ffprobe:
-
-            try:
-
-                cmd_info = [
-
-                    current_ffprobe, '-v', 'error', '-show_entries', 'format=duration',
-
-                    '-of', 'default=noprint_wrappers=1:nokey=1', filepath
-
-                ]
-
-                res = subprocess.run(
-
-                    cmd_info, capture_output=True, text=True, timeout=3,
-
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-
-                )
-
-                if res.stdout.strip():
-
-                    total_duration_sec = float(res.stdout.strip())
-
-            except Exception: pass
-    elif details['type'] == 'animated_image':
-        try:
+            Image.MAX_IMAGE_PIXELS = None
             with Image.open(filepath) as img:
-                if getattr(img, 'is_animated', False):
-                    if ext_lower == '.gif': total_duration_sec = sum(frame.info.get('duration', 100) for frame in ImageSequence.Iterator(img)) / 1000
-                    elif ext_lower == '.webp': total_duration_sec = getattr(img, 'n_frames', 1) / WEBP_ANIMATED_FPS
-        except Exception: pass
+                is_anim = bool(getattr(img, 'is_animated', False))
+                if ext_lower == '.webp':
+                    details['type'] = 'animated_image' if is_anim else 'image'
+                details['dimensions'] = f"{img.width}x{img.height}"
+                found_wfs = _extract_workflows_from_pil_image(img)
+                if details['type'] == 'animated_image' and is_anim:
+                    if ext_lower == '.gif':
+                        total_duration_sec = sum(frame.info.get('duration', 100) for frame in ImageSequence.Iterator(img)) / 1000
+                    elif ext_lower == '.webp':
+                        total_duration_sec = getattr(img, 'n_frames', 1) / WEBP_ANIMATED_FPS
+        except Exception:
+            if details['type'] == 'unknown' and ext_lower == '.webp':
+                details['type'] = 'image'
+
+        if not found_wfs:
+            for chunk in _read_head_tail_bytes(filepath, 262144):
+                for json_str in _scan_bytes_for_workflow(chunk):
+                    wf, wf_type = _validate_and_get_workflow(json_str)
+                    if wf and wf_type and wf_type not in found_wfs:
+                        found_wfs[wf_type] = wf
+                    if 'api' in found_wfs:
+                        break
+                if 'api' in found_wfs:
+                    break
+
+        if found_wfs:
+            details['has_workflow'] = 1
+            details['workflow_json'] = found_wfs.get('api') or next(iter(found_wfs.values()))
+            if 'ui' in found_wfs:
+                details['workflow_ui'] = found_wfs['ui']
+    else:
+        wf_found = extract_workflow(filepath, target_type='api')
+        if wf_found:
+            details['has_workflow'] = 1
+            details['workflow_json'] = wf_found
+        if details['type'] == 'video':
+            try:
+                cap = cv2.VideoCapture(filepath)
+                if cap.isOpened():
+                    fps, count = cap.get(cv2.CAP_PROP_FPS), cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    if fps > 0 and count > 0: total_duration_sec = count / fps
+                    details['dimensions'] = f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
+                    cap.release()
+            except Exception: pass
+        elif details['type'] == 'audio':
+            current_ffprobe = FFPROBE_EXECUTABLE_PATH or find_ffprobe_path()
+            if current_ffprobe:
+                try:
+                    cmd_info = [
+                        current_ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+                        '-of', 'default=noprint_wrappers=1:nokey=1', filepath
+                    ]
+                    res = subprocess.run(
+                        cmd_info, capture_output=True, text=True, timeout=3,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    )
+                    if res.stdout.strip():
+                        total_duration_sec = float(res.stdout.strip())
+                except Exception: pass
+
     if total_duration_sec > 0: details['duration'] = format_duration(total_duration_sec)
     return details
 
@@ -1682,6 +1815,185 @@ def create_waveform(filepath, file_hash, file_type, amp=1.0):
         pass # Silently fail if corrupted or timeout
     return None
 
+_THUMB_EXTS = ('.jpeg', '.webp', '.gif', '.png')
+_PREVIEW_EXTS = ('.jpeg', '.webp')
+_preview_locks = {}
+_preview_locks_guard = threading.Lock()
+
+def _find_cached_thumbnail(file_hash):
+    """O(1) stat lookup by known extensions instead of O(N) glob.glob directory scan."""
+    for ext in _THUMB_EXTS:
+        p = os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}{ext}")
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                return p
+        except OSError:
+            pass
+    return None
+
+def _atomic_save_image(img, target_path, fmt, **save_kwargs):
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    tmp_path = f"{target_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        img.save(tmp_path, fmt, **save_kwargs)
+        os.replace(tmp_path, target_path)
+        return target_path
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+def _to_rgb_dark_bg(img):
+    if img.mode == 'RGB':
+        return img
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        rgba = img.convert('RGBA')
+        bg = Image.new('RGB', rgba.size, (17, 17, 17))
+        bg.paste(rgba, mask=rgba.getchannel('A'))
+        return bg
+    return img.convert('RGB')
+
+def _image_has_real_alpha(img):
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        try:
+            rgba = img if img.mode == 'RGBA' else img.convert('RGBA')
+            lo, _ = rgba.getchannel('A').getextrema()
+            return lo < 250
+        except Exception:
+            return False
+    return False
+
+def _needs_preview(file_type, file_size=0, dimensions_str=''):
+    if file_type != 'image':
+        return False
+    if (file_size or 0) >= PREVIEW_MIN_BYTES:
+        return True
+    if dimensions_str and 'x' in dimensions_str:
+        try:
+            w_s, h_s = dimensions_str.split('x', 1)
+            if max(int(w_s), int(h_s)) > PREVIEW_MAX_DIM:
+                return True
+        except ValueError:
+            pass
+    return False
+
+def _find_cached_preview(file_hash):
+    for ext in _PREVIEW_EXTS:
+        p = os.path.join(PREVIEW_CACHE_DIR, f"{file_hash}{ext}")
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                return p
+        except OSError:
+            pass
+    return None
+
+def create_image_thumb_and_preview(filepath, file_hash, file_type, want_thumb=True, want_preview=False, silent=True):
+    """
+    Single-decode generator for static/animated images:
+    When a 4K image needs both a 2048px preview and a 300px thumbnail, decodes the source PNG/JPEG ONCE,
+    saves the mid-res preview, then downscales the in-memory preview to 300px in ~2ms.
+    Returns (thumb_path, preview_path).
+    """
+    Image.MAX_IMAGE_PIXELS = None
+    if not os.path.exists(filepath):
+        return None, None
+    try:
+        if os.path.getsize(filepath) == 0:
+            return None, None
+    except OSError:
+        return None, None
+
+    thumb_out = None
+    prev_out = None
+
+    if file_type in ['image', 'animated_image']:
+        try:
+            with Image.open(filepath) as img:
+                if file_type == 'animated_image' and getattr(img, 'is_animated', False):
+                    if want_thumb:
+                        fmt = 'gif' if img.format == 'GIF' else 'webp'
+                        cache_path = os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}.{fmt}")
+                        frames = [fr.copy() for fr in ImageSequence.Iterator(img)]
+                        if frames:
+                            for frame in frames:
+                                frame.thumbnail((THUMBNAIL_WIDTH, THUMBNAIL_WIDTH * 2), Image.Resampling.LANCZOS)
+                            processed_frames = [frame.convert('RGBA').convert('RGB') for frame in frames]
+                            if processed_frames:
+                                os.makedirs(THUMBNAIL_CACHE_DIR, exist_ok=True)
+                                tmp_anim = f"{cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+                                try:
+                                    processed_frames[0].save(
+                                        tmp_anim,
+                                        format=fmt.upper(),
+                                        save_all=True,
+                                        append_images=processed_frames[1:],
+                                        duration=img.info.get('duration', 100),
+                                        loop=img.info.get('loop', 0),
+                                        optimize=True
+                                    )
+                                    os.replace(tmp_anim, cache_path)
+                                    thumb_out = cache_path
+                                finally:
+                                    if os.path.exists(tmp_anim):
+                                        try: os.remove(tmp_anim)
+                                        except OSError: pass
+                    return thumb_out, None
+
+                target_decode = PREVIEW_MAX_DIM if want_preview else THUMBNAIL_WIDTH * 2
+                if img.format == 'JPEG':
+                    try:
+                        img.draft('RGB', (target_decode, target_decode))
+                    except Exception:
+                        pass
+
+                work = img
+                if want_preview:
+                    if max(work.width, work.height) > PREVIEW_MAX_DIM:
+                        work = work.copy()
+                        work.thumbnail((PREVIEW_MAX_DIM, PREVIEW_MAX_DIM), Image.Resampling.LANCZOS)
+                    if _image_has_real_alpha(work):
+                        prev_target = os.path.join(PREVIEW_CACHE_DIR, f"{file_hash}.webp")
+                        prev_out = _atomic_save_image(work.convert('RGBA'), prev_target, 'WEBP', quality=86, method=1)
+                    else:
+                        work_rgb = _to_rgb_dark_bg(work)
+                        prev_target = os.path.join(PREVIEW_CACHE_DIR, f"{file_hash}.jpeg")
+                        prev_out = _atomic_save_image(work_rgb, prev_target, 'JPEG', quality=88)
+                        work = work_rgb
+
+                if want_thumb:
+                    thumb_img = work.copy() if (want_preview and work is not img) else img
+                    thumb_img.thumbnail((THUMBNAIL_WIDTH, THUMBNAIL_WIDTH * 2), Image.Resampling.LANCZOS)
+                    thumb_rgb = _to_rgb_dark_bg(thumb_img)
+                    cache_path = os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}.jpeg")
+                    thumb_out = _atomic_save_image(thumb_rgb, cache_path, 'JPEG', quality=85)
+
+                return thumb_out, prev_out
+        except Exception as e:
+            if not silent:
+                print(f"ERROR (Pillow): Image thumb/preview failed for {os.path.basename(filepath)}: {e}")
+
+    return thumb_out, prev_out
+
+def create_preview(filepath, file_hash, file_type, silent=True):
+    if file_type != 'image':
+        return None
+    existing = _find_cached_preview(file_hash)
+    if existing:
+        return existing
+    with _preview_locks_guard:
+        lock = _preview_locks.setdefault(file_hash, threading.Lock())
+    with lock:
+        existing = _find_cached_preview(file_hash)
+        if existing:
+            return existing
+        _, prev_path = create_image_thumb_and_preview(
+            filepath, file_hash, file_type, want_thumb=False, want_preview=True, silent=silent
+        )
+        return prev_path
+
 def create_thumbnail(filepath, file_hash, file_type, silent=True):
     Image.MAX_IMAGE_PIXELS = None 
     if not os.path.exists(filepath): return None
@@ -1692,37 +2004,10 @@ def create_thumbnail(filepath, file_hash, file_type, silent=True):
     
     # --- IMAGES / ANIMATIONS ---
     if file_type in ['image', 'animated_image']:
-        try:
-            with Image.open(filepath) as img:
-                if file_type == 'animated_image' and getattr(img, 'is_animated', False):
-                    fmt = 'gif' if img.format == 'GIF' else 'webp'
-                    cache_path = os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}.{fmt}")
-                    frames = [fr.copy() for fr in ImageSequence.Iterator(img)]
-                    if frames:
-                        for frame in frames: 
-                            frame.thumbnail((THUMBNAIL_WIDTH, THUMBNAIL_WIDTH * 2), Image.Resampling.LANCZOS)
-                        
-                        processed_frames = [frame.convert('RGBA').convert('RGB') for frame in frames]
-                        if processed_frames:
-                            processed_frames[0].save(
-                                cache_path, 
-                                save_all=True, 
-                                append_images=processed_frames[1:], 
-                                duration=img.info.get('duration', 100), 
-                                loop=img.info.get('loop', 0), 
-                                optimize=True
-                            )
-                            return cache_path
-                else:
-                    cache_path = os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}.jpeg")
-                    img.thumbnail((THUMBNAIL_WIDTH, THUMBNAIL_WIDTH * 2), Image.Resampling.LANCZOS)
-                    if img.mode != 'RGB': img = img.convert('RGB')
-                    img.save(cache_path, 'JPEG', quality=85)
-                    return cache_path
-                    
-        except Exception as e: 
-            if not silent:
-                print(f"ERROR (Pillow): Thumbnail failed for {os.path.basename(filepath)}: {e}")
+        thumb_path, _ = create_image_thumb_and_preview(
+            filepath, file_hash, file_type, want_thumb=True, want_preview=False, silent=silent
+        )
+        return thumb_path
 
     # --- VIDEOS (MP4, MOV, MKV, AVI, etc.) ---
     elif file_type == 'video':
@@ -2060,6 +2345,26 @@ def prune_orphan_legacy_thumbnails(conn):
         print(f"WARNING: Legacy thumbnail sweep skipped: {exc}")
 
 
+def _remove_cached_media_artifacts(filepath, mtime):
+    """Removes cached legacy thumbnail and mid-res preview files for a deleted file."""
+    if not filepath or mtime is None:
+        return
+    try:
+        file_hash = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
+        for ext in _THUMB_EXTS:
+            p = os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}{ext}")
+            if os.path.exists(p):
+                try: os.remove(p)
+                except OSError: pass
+        for ext in _PREVIEW_EXTS:
+            p = os.path.join(PREVIEW_CACHE_DIR, f"{file_hash}{ext}")
+            if os.path.exists(p):
+                try: os.remove(p)
+                except OSError: pass
+    except Exception:
+        pass
+
+
 def cleanup_deleted_file_thumbnails(conn, file_info):
     """Call after committing record deletion; shared SHA256 entries stay referenced."""
     try:
@@ -2072,7 +2377,15 @@ def cleanup_deleted_file_thumbnails(conn, file_info):
                 pass
             except OSError as exc:
                 print(f"WARNING: Could not remove deleted file thumbnail {path}: {exc}")
-        digest = file_info['content_sha256']
+        for extension in _PREVIEW_EXTS:
+            prev_path = os.path.join(PREVIEW_CACHE_DIR, key + extension)
+            try:
+                os.unlink(prev_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"WARNING: Could not remove deleted file preview {prev_path}: {exc}")
+        digest = file_info.get('content_sha256')
         if not digest or conn.execute('SELECT 1 FROM files WHERE content_sha256 = ? LIMIT 1', (digest,)).fetchone():
             return
         if not re.fullmatch(r'[0-9a-f]{64}', digest):
@@ -2092,8 +2405,9 @@ def cleanup_deleted_file_thumbnails(conn, file_info):
         print(f"WARNING: Deleted file thumbnail cleanup skipped: {exc}")
 
 
-def ensure_image_thumbnail(filepath, digest, mtime, expected_stat=None):
-    """Reuse content thumbnails, or migrate a legacy path-based thumbnail."""
+def ensure_image_thumbnail(filepath, digest, mtime, expected_stat=None, source_override=None):
+    """Reuse content thumbnails, or migrate a legacy path-based thumbnail / pre-decoded 2K preview."""
+    Image.MAX_IMAGE_PIXELS = None
     initial_stat = os.stat(filepath)
     if expected_stat and (initial_stat.st_size, initial_stat.st_mtime_ns) != (expected_stat.st_size, expected_stat.st_mtime_ns):
         raise OSError('Image changed before thumbnail generation')
@@ -2101,9 +2415,12 @@ def ensure_image_thumbnail(filepath, digest, mtime, expected_stat=None):
     if valid_image_thumbnail(target):
         cleanup_legacy_image_thumbnails(filepath, digest, mtime)
         return target
-    legacy_hash = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
-    legacy = glob.glob(os.path.join(THUMBNAIL_CACHE_DIR, legacy_hash + '.*'))
-    source = next((path for path in legacy if valid_image_thumbnail(path)), filepath)
+    if source_override and os.path.exists(source_override):
+        source = source_override
+    else:
+        legacy_hash = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
+        legacy_thumb = _find_cached_thumbnail(legacy_hash)
+        source = legacy_thumb if (legacy_thumb and valid_image_thumbnail(legacy_thumb)) else filepath
     directory = os.path.dirname(target)
     os.makedirs(directory, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=directory, suffix='.webp', delete=False) as temp:
@@ -2149,20 +2466,34 @@ def file_needs_processing(stat, row):
             (row['type'] in ('image', 'animated_image') and not row['content_sha256']))
 
 
-def process_single_file(filepath):
+def process_single_file(filepath, _allow_defer=False):
     """
     Worker function to perform all heavy processing for a single file.
-    Designed to be run in a parallel process pool.
+    Designed to be run in a parallel process or thread pool.
     """
     try:
-        if not os.path.exists(filepath): return None
         try:
-            if os.path.getsize(filepath) == 0: return None
+            initial_stat = os.stat(filepath)
         except OSError:
             return None
+        if initial_stat.st_size <= 0:
+            return '__DEFER_WRITING__' if _allow_defer else None
 
-        initial_stat = os.stat(filepath)
         mtime = initial_stat.st_mtime
+        file_size = initial_stat.st_size
+
+        if _is_file_still_writing(filepath, file_size, mtime):
+            if _allow_defer:
+                return '__DEFER_WRITING__'
+            time.sleep(0.5)
+            try:
+                initial_stat = os.stat(filepath)
+                mtime, file_size = initial_stat.st_mtime, initial_stat.st_size
+            except OSError:
+                return None
+            if _is_file_still_writing(filepath, file_size, mtime):
+                return None
+
         content_sha256 = None
         cached_metadata = None
         if os.path.splitext(filepath)[1].lower() in IMAGE_CACHE_EXTENSIONS:
@@ -2176,18 +2507,32 @@ def process_single_file(filepath):
             return None
 
         file_hash_for_thumbnail = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
-        
-        if not content_sha256 and not glob.glob(os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash_for_thumbnail}.*")):
-            thumb = create_thumbnail(filepath, file_hash_for_thumbnail, metadata['type'], silent=True)
-            if not thumb or not os.path.exists(thumb):
-                time.sleep(0.2)
+        want_prev = _needs_preview(metadata['type'], file_size, metadata.get('dimensions', '')) and not _find_cached_preview(file_hash_for_thumbnail)
+        prev_path = _find_cached_preview(file_hash_for_thumbnail)
+
+        if content_sha256:
+            if want_prev:
+                prev_path = create_preview(filepath, file_hash_for_thumbnail, metadata['type'], silent=True)
+        else:
+            want_thumb = not _find_cached_thumbnail(file_hash_for_thumbnail)
+            if metadata['type'] in ['image', 'animated_image']:
+                if want_thumb or want_prev:
+                    _, prev_out = create_image_thumb_and_preview(
+                        filepath, file_hash_for_thumbnail, metadata['type'],
+                        want_thumb=want_thumb, want_preview=want_prev, silent=True
+                    )
+                    if prev_out:
+                        prev_path = prev_out
+            elif want_thumb:
                 thumb = create_thumbnail(filepath, file_hash_for_thumbnail, metadata['type'], silent=True)
+                if not thumb or not os.path.exists(thumb):
+                    time.sleep(0.2)
+                    create_thumbnail(filepath, file_hash_for_thumbnail, metadata['type'], silent=True)
         
         if GENERATE_WAVEFORMS and metadata['type'] in ['video', 'audio']:
             create_waveform(filepath, file_hash_for_thumbnail, metadata['type'])
         
         file_id = hashlib.md5(filepath.encode()).hexdigest()
-        file_size = os.path.getsize(filepath)
         
         workflow_files_content = ""
         workflow_prompt_content = ""
@@ -2200,7 +2545,9 @@ def process_single_file(filepath):
             wf_hash = cached_metadata['workflow_hash']
             pr_hash = cached_metadata['prompt_hash']
         elif metadata['has_workflow']:
-            wf_json = extract_workflow(filepath, target_type='api')
+            wf_json = metadata.get('workflow_json') or metadata.get('workflow_ui')
+            if not wf_json:
+                wf_json = extract_workflow(filepath, target_type='api')
             if not wf_json:
                 wf_json = extract_workflow(filepath, target_type='ui')
             
@@ -2214,7 +2561,8 @@ def process_single_file(filepath):
             return None  # Retry files that changed during hashing/extraction on the next scan.
         if content_sha256:
             try:
-                ensure_image_thumbnail(filepath, content_sha256, mtime, initial_stat)
+                thumb_src = prev_path if (metadata['type'] == 'image' and prev_path) else None
+                ensure_image_thumbnail(filepath, content_sha256, mtime, initial_stat, source_override=thumb_src)
             except Exception as exc:
                 print(f"WARNING: Image thumbnail cache write failed: {exc}")
                 create_thumbnail(filepath, file_hash_for_thumbnail, metadata['type'], silent=True)
@@ -2505,6 +2853,7 @@ def init_db(conn=None):
                     print(f"WARNING: Could not add column {col_name}: {e}")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_content_sha256 ON files(content_sha256)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime)")
 
         # 6. SCHEMA VERSION (Managed in check_and_update_workflow_hashes)
         pass
@@ -2571,7 +2920,7 @@ def get_dynamic_folder_config(force_refresh=False):
 
         all_folders = {}
         for dirpath, dirnames, _ in os.walk(BASE_OUTPUT_PATH, followlinks=True):
-            dirnames[:] = [d for d in dirnames if (not d.startswith('.') or d == '.collection_notes') and d not in [THUMBNAIL_CACHE_FOLDER_NAME, SQLITE_CACHE_FOLDER_NAME, ZIP_CACHE_FOLDER_NAME, AI_MODELS_FOLDER_NAME]]
+            dirnames[:] = [d for d in dirnames if (not d.startswith('.') or d == '.collection_notes') and d not in [THUMBNAIL_CACHE_FOLDER_NAME, PREVIEW_CACHE_FOLDER_NAME, SQLITE_CACHE_FOLDER_NAME, ZIP_CACHE_FOLDER_NAME, AI_MODELS_FOLDER_NAME]]
             for dirname in dirnames:
                 full_path = os.path.normpath(os.path.join(dirpath, dirname)).replace('\\', '/')
                 relative_path = os.path.relpath(full_path, BASE_OUTPUT_PATH).replace('\\', '/')
@@ -2689,7 +3038,7 @@ def background_watcher_task():
                         is_recursive = row['recursive']
                         
                         valid_exts = {'.png','.jpg','.jpeg','.webp','.gif','.mp4','.mov','.avi','.webm','.txt','.md'}
-                        EXCLUDED = {'.thumbnails_cache', '.sqlite_cache', '.zip_downloads', '.AImodels', 'venv', 'venv-ai', '.git'}
+                        EXCLUDED = {'.thumbnails_cache', '.previews_cache', '.sqlite_cache', '.zip_downloads', '.AImodels', 'venv', 'venv-ai', '.git'}
                         
                         files_to_check = []
 
@@ -3022,6 +3371,38 @@ def stream_folder_sync(folder_path):
             return
 
 
+_UPSERT_FILES_SQL = """
+    INSERT INTO files (id, path, mtime, name, type, duration, dimensions, has_workflow, size, last_scanned, workflow_files, workflow_prompt, workflow_hash, prompt_hash, content_sha256)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        path = excluded.path,
+        name = excluded.name,
+        type = excluded.type,
+        duration = excluded.duration,
+        dimensions = excluded.dimensions,
+        has_workflow = excluded.has_workflow,
+        size = excluded.size,
+        last_scanned = excluded.last_scanned,
+        workflow_files = excluded.workflow_files,
+        workflow_prompt = excluded.workflow_prompt,
+        workflow_hash = excluded.workflow_hash,
+        prompt_hash = excluded.prompt_hash,
+        content_sha256 = excluded.content_sha256,
+        is_favorite = CASE WHEN ((files.content_sha256 IS NOT NULL AND excluded.content_sha256 IS NOT NULL AND files.content_sha256 != excluded.content_sha256) OR ((files.content_sha256 IS NULL OR excluded.content_sha256 IS NULL) AND (files.mtime != excluded.mtime OR files.size != excluded.size))) THEN 0 ELSE files.is_favorite END,
+        ai_caption = CASE WHEN ((files.content_sha256 IS NOT NULL AND excluded.content_sha256 IS NOT NULL AND files.content_sha256 != excluded.content_sha256) OR ((files.content_sha256 IS NULL OR excluded.content_sha256 IS NULL) AND (files.mtime != excluded.mtime OR files.size != excluded.size))) THEN NULL ELSE files.ai_caption END,
+        ai_embedding = CASE WHEN ((files.content_sha256 IS NOT NULL AND excluded.content_sha256 IS NOT NULL AND files.content_sha256 != excluded.content_sha256) OR ((files.content_sha256 IS NULL OR excluded.content_sha256 IS NULL) AND (files.mtime != excluded.mtime OR files.size != excluded.size))) THEN NULL ELSE files.ai_embedding END,
+        ai_last_scanned = CASE WHEN ((files.content_sha256 IS NOT NULL AND excluded.content_sha256 IS NOT NULL AND files.content_sha256 != excluded.content_sha256) OR ((files.content_sha256 IS NULL OR excluded.content_sha256 IS NULL) AND (files.mtime != excluded.mtime OR files.size != excluded.size))) THEN 0 ELSE files.ai_last_scanned END,
+        mtime = excluded.mtime
+"""
+
+def _flush_upsert_batch(batch):
+    if not batch:
+        return
+    with get_db_connection() as conn:
+        conn.executemany(_UPSERT_FILES_SQL, batch)
+        conn.commit()
+    batch.clear()
+
 def sync_folder_on_demand(folder_path):
     yield f"data: {json.dumps({'message': 'Checking folder for changes...', 'current': 0, 'total': 1})}\n\n"
     
@@ -3072,16 +3453,17 @@ def sync_folder_on_demand(folder_path):
         files_to_process = list(files_to_add.union(files_to_update))
         total_files = len(files_to_process)
         data_to_upsert = []
+        pending_batch = []
         
         if total_files > 0:
             yield f"data: {json.dumps({'message': f'Found {total_files} new/modified file(s). Processing...', 'current': 0, 'total': total_files})}\n\n"
             
-            # Use ThreadPoolExecutor to prevent POSIX fork deadlocks inside Waitress WSGI threads
-            max_sync_workers = min(8, max(1, total_files))
+            # Cap worker count to SYNC_MAX_WORKERS so background image decoding never starves Waitress HTTP threads
+            max_sync_workers = min(SYNC_MAX_WORKERS, max(1, total_files))
             processed_count = 0
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_sync_workers) as executor:
-                futures = {executor.submit(process_single_file, path): path for path in files_to_process}
+                futures = {executor.submit(process_single_file, path, True): path for path in files_to_process}
                 pending = set(futures)
                 while pending:
                     done, pending = concurrent.futures.wait(
@@ -3093,48 +3475,36 @@ def sync_folder_on_demand(folder_path):
                         processed_count += 1
                         try:
                             res = future.result()
-                            if res:
+                            if res == '__DEFER_WRITING__':
+                                pass
+                            elif res:
                                 data_to_upsert.append(res)
+                                pending_batch.append(res)
+                                if len(pending_batch) >= 25:
+                                    _flush_upsert_batch(pending_batch)
                         except Exception as err:
                             print(f"WARNING: Processing error on {os.path.basename(path)}: {err}")
 
                         # Real-time progressive feedback to the client
                         yield f"data: {json.dumps({'message': f'Processing {processed_count}/{total_files}: {os.path.basename(path)}', 'current': processed_count, 'total': total_files})}\n\n"
 
-        with get_db_connection() as conn:
-            if data_to_upsert:
-                conn.executemany("""
-                    INSERT INTO files (id, path, mtime, name, type, duration, dimensions, has_workflow, size, last_scanned, workflow_files, workflow_prompt, workflow_hash, prompt_hash, content_sha256)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        path = excluded.path,
-                        name = excluded.name,
-                        type = excluded.type,
-                        duration = excluded.duration,
-                        dimensions = excluded.dimensions,
-                        has_workflow = excluded.has_workflow,
-                        size = excluded.size,
-                        last_scanned = excluded.last_scanned,
-                        workflow_files = excluded.workflow_files,
-                        workflow_prompt = excluded.workflow_prompt,
-                        workflow_hash = excluded.workflow_hash,
-                        prompt_hash = excluded.prompt_hash,
-                        content_sha256 = excluded.content_sha256,
-                        is_favorite = CASE WHEN ((files.content_sha256 IS NOT NULL AND excluded.content_sha256 IS NOT NULL AND files.content_sha256 != excluded.content_sha256) OR ((files.content_sha256 IS NULL OR excluded.content_sha256 IS NULL) AND (files.mtime != excluded.mtime OR files.size != excluded.size))) THEN 0 ELSE files.is_favorite END,
-                        ai_caption = CASE WHEN ((files.content_sha256 IS NOT NULL AND excluded.content_sha256 IS NOT NULL AND files.content_sha256 != excluded.content_sha256) OR ((files.content_sha256 IS NULL OR excluded.content_sha256 IS NULL) AND (files.mtime != excluded.mtime OR files.size != excluded.size))) THEN NULL ELSE files.ai_caption END,
-                        ai_embedding = CASE WHEN ((files.content_sha256 IS NOT NULL AND excluded.content_sha256 IS NOT NULL AND files.content_sha256 != excluded.content_sha256) OR ((files.content_sha256 IS NULL OR excluded.content_sha256 IS NULL) AND (files.mtime != excluded.mtime OR files.size != excluded.size))) THEN NULL ELSE files.ai_embedding END,
-                        ai_last_scanned = CASE WHEN ((files.content_sha256 IS NOT NULL AND excluded.content_sha256 IS NOT NULL AND files.content_sha256 != excluded.content_sha256) OR ((files.content_sha256 IS NULL OR excluded.content_sha256 IS NULL) AND (files.mtime != excluded.mtime OR files.size != excluded.size))) THEN 0 ELSE files.ai_last_scanned END,
-                        mtime = excluded.mtime
-                """, data_to_upsert) 
-                
-            if files_to_delete:
-                del_placeholders = ','.join(['?'] * len(files_to_delete))
-                conn.execute(f"DELETE FROM files WHERE path IN ({del_placeholders})", list(files_to_delete))
+            _flush_upsert_batch(pending_batch)
 
-            conn.commit()
+        removed_ids = []
+        if files_to_delete:
+            with get_db_connection() as conn:
+                del_list = list(files_to_delete)
+                del_placeholders = ','.join(['?'] * len(del_list))
+                del_rows = [dict(r) for r in conn.execute(f"SELECT id, path, mtime, content_sha256 FROM files WHERE path IN ({del_placeholders})", del_list).fetchall()]
+                removed_ids = [r['id'] for r in del_rows]
+                conn.execute(f"DELETE FROM files WHERE path IN ({del_placeholders})", del_list)
+                conn.commit()
+                for f_info in del_rows:
+                    cleanup_deleted_file_thumbnails(conn, f_info)
 
         if data_to_upsert or files_to_delete:
-            yield f"data: {json.dumps({'message': 'Sync complete. Reloading...', 'status': 'reloading', 'current': total_files, 'total': total_files})}\n\n"
+            added_ids = [row[0] for row in data_to_upsert]
+            yield f"data: {json.dumps({'message': 'Sync complete. Reloading...', 'status': 'reloading', 'current': total_files, 'total': total_files, 'added_ids': added_ids, 'removed_ids': removed_ids})}\n\n"
         else:
             yield f"data: {json.dumps({'message': 'Folder is up-to-date.', 'status': 'no_changes', 'current': total_files, 'total': total_files})}\n\n"
 
@@ -3158,7 +3528,7 @@ def scan_folder_and_extract_options(folder_path, recursive=False):
             # Recursive scan using os.walk
             for root, dirs, files in os.walk(folder_path, followlinks=True):
                 # Filter out hidden/protected folders in-place
-                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in [THUMBNAIL_CACHE_FOLDER_NAME, SQLITE_CACHE_FOLDER_NAME, ZIP_CACHE_FOLDER_NAME, AI_MODELS_FOLDER_NAME]]
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in [THUMBNAIL_CACHE_FOLDER_NAME, PREVIEW_CACHE_FOLDER_NAME, SQLITE_CACHE_FOLDER_NAME, ZIP_CACHE_FOLDER_NAME, AI_MODELS_FOLDER_NAME]]
                 for filename in files:
                     ext = os.path.splitext(filename)[1].lower()
                     if ext and ext not in ['.json', '.sqlite']:
@@ -3205,6 +3575,7 @@ def initialize_gallery_fast_no_db_check():
     global FFPROBE_EXECUTABLE_PATH
     FFPROBE_EXECUTABLE_PATH = find_ffprobe_path()
     os.makedirs(THUMBNAIL_CACHE_DIR, exist_ok=True)
+    os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
     os.makedirs(SQLITE_CACHE_DIR, exist_ok=True)
     
     with get_db_connection() as conn:
@@ -3360,6 +3731,35 @@ def check_exhibition_requirements():
         print(f"\n{Colors.RED}{Colors.BOLD}❌ CRITICAL ERROR: Database corrupted or inaccessible: {e}{Colors.RESET}")
         sys.exit(1)
 
+def _background_preview_warmup():
+    """
+    Low-priority background task on startup that pre-generates 2048px mid-res previews
+    for the most recent large/4K images so Lightbox/Compare opens instantaneously.
+    """
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT path, mtime, type, size, dimensions FROM files WHERE type = 'image' AND size >= ? ORDER BY mtime DESC LIMIT 400",
+                (PREVIEW_MIN_BYTES,)
+            ).fetchall()
+        generated = 0
+        for row in rows:
+            filepath = row['path']
+            mtime = row['mtime']
+            if not _needs_preview(row['type'], row['size'], row['dimensions'] or ''):
+                continue
+            file_hash = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
+            if _find_cached_preview(file_hash):
+                continue
+            if os.path.exists(filepath) and not _is_file_still_writing(filepath, row['size'], mtime):
+                if create_preview(filepath, file_hash, 'image', silent=True):
+                    generated += 1
+                time.sleep(0.05)
+        if generated > 0:
+            print(f"INFO: Background preview warm-up generated {generated} mid-res 4K previews.")
+    except Exception as e:
+        print(f"WARN: Preview warm-up skipped: {e}")
+
 def initialize_gallery():
     print("INFO: Initializing gallery...")
     
@@ -3370,6 +3770,7 @@ def initialize_gallery():
     global FFPROBE_EXECUTABLE_PATH
     FFPROBE_EXECUTABLE_PATH = find_ffprobe_path()
     os.makedirs(THUMBNAIL_CACHE_DIR, exist_ok=True)
+    os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
     os.makedirs(SQLITE_CACHE_DIR, exist_ok=True)
     os.makedirs(CLEAN_CACHE_DIR, exist_ok=True)
     os.makedirs(os.path.join(BASE_SMARTGALLERY_PATH, '.collection_notes'), exist_ok=True)
@@ -3947,6 +4348,8 @@ def compare_files_api():
     def get_flat_params(file_id):
         try:
             info = get_file_info_from_db(file_id)
+            if not info.get('has_workflow'):
+                return {}
             wf_json = extract_workflow(info['path'])
             if not wf_json: return {}
             
@@ -4188,7 +4591,7 @@ def ai_indexing_add_folder():
     # 2. BACKGROUND SCAN & QUEUE
     def _scan():
         valid = {'.png','.jpg','.jpeg','.webp','.gif','.mp4','.mov','.avi','.webm'}
-        exc = {'.thumbnails_cache', '.sqlite_cache', '.zip_downloads', '.AImodels', 'venv', '.git'}
+        exc = {'.thumbnails_cache', '.previews_cache', '.sqlite_cache', '.zip_downloads', '.AImodels', 'venv', '.git'}
         files_found = []
         try:
             if recursive:
@@ -5900,6 +6303,75 @@ def load_more():
     if offset >= len(gallery_view_cache): return jsonify(files=[])
     return jsonify(files=gallery_view_cache[offset:offset + PAGE_SIZE])
 
+@app.route('/galleryout/api/files_brief', methods=['POST'])
+def files_brief():
+    """Card data for files just synced, without reloading the page."""
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'files': []}), 401
+    data = request.json or {}
+    raw_ids = data.get('ids') or []
+    if not isinstance(raw_ids, list):
+        return jsonify({'files': []}), 400
+    ids = [str(i) for i in raw_ids[:500] if isinstance(i, str) and 1 <= len(i) <= 64]
+    removed = data.get('removed_ids') or []
+    if not isinstance(removed, list):
+        removed = []
+    removed = {str(i) for i in removed[:500] if isinstance(i, str)}
+
+    global gallery_view_cache
+    if removed:
+        gallery_view_cache = [f for f in gallery_view_cache if f.get('id') not in removed]
+    if not ids:
+        return jsonify({'files': []})
+
+    user_role = session.get('role', 'GUEST')
+    safe_uuid = str(session.get('user_id', '')).replace("'", "''")
+    is_local_admin = (not FORCE_LOGIN and not IS_EXHIBITION_MODE)
+    if is_local_admin or user_role in ['ADMIN', 'MANAGER', 'STAFF']:
+        comment_sub_filter = ""
+    else:
+        comment_sub_filter = f" AND (target_audience = 'public' OR target_audience = 'user:{safe_uuid}' OR client_uuid = '{safe_uuid}')"
+
+    placeholders = ','.join(['?'] * len(ids))
+    query = f"""
+        SELECT f.*,
+        (
+            SELECT c.color
+            FROM collections c
+            JOIN collection_files cf ON c.id = cf.collection_id
+            WHERE cf.file_id = f.id AND c.type = 'system_flag'
+            LIMIT 1
+        ) as status_color,
+        (SELECT AVG(rating) FROM file_ratings WHERE file_id = f.id) as avg_rating,
+        (SELECT COUNT(*) FROM file_ratings WHERE file_id = f.id) as vote_count,
+        (SELECT rating FROM file_ratings WHERE file_id = f.id AND client_uuid = '{safe_uuid}') as my_rating,
+        (SELECT COUNT(*) FROM file_comments WHERE file_id = f.id {comment_sub_filter}) as comment_count,
+        (SELECT MAX(created_at) FROM file_comments WHERE file_id = f.id {comment_sub_filter}) as latest_comment_time
+        FROM files f
+        WHERE f.id IN ({placeholders})
+    """
+    with get_db_connection() as conn:
+        rows = []
+        for r in conn.execute(query, ids).fetchall():
+            d = dict(r)
+            d.pop('ai_embedding', None)
+            rows.append(d)
+    rows.sort(key=lambda r: r.get('mtime') or 0, reverse=True)
+
+    sort_by = data.get('sort_by') or 'date'
+    sort_order = data.get('sort_order') or 'desc'
+    if sort_by == 'date' and str(sort_order).lower() != 'asc' and rows:
+        same_folder = True
+        if gallery_view_cache:
+            cached_dir = os.path.normpath(os.path.dirname(gallery_view_cache[0].get('path') or '')).replace('\\', '/').lower()
+            new_dir = os.path.normpath(os.path.dirname(rows[0].get('path') or '')).replace('\\', '/').lower()
+            same_folder = cached_dir == new_dir
+        if same_folder:
+            existing = {f.get('id') for f in gallery_view_cache}
+            fresh = [r for r in rows if r.get('id') not in existing]
+            gallery_view_cache = fresh + gallery_view_cache
+    return jsonify({'files': rows})
+
 def get_file_info_from_db(file_id, column='*'):
     with get_db_connection() as conn:
         row = conn.execute(f"SELECT {column} FROM files WHERE id = ?", (file_id,)).fetchone()
@@ -6660,16 +7132,46 @@ def serve_thumbnail(file_id):
                 with get_db_connection() as conn:
                     conn.execute('UPDATE files SET content_sha256 = ? WHERE id = ?', (digest, file_id))
                     conn.commit()
-            return send_file(ensure_image_thumbnail(filepath, digest, mtime))
+            return send_file(ensure_image_thumbnail(filepath, digest, mtime), conditional=True, max_age=86400)
         except Exception as exc:
             print(f"WARNING: Image thumbnail cache unavailable: {exc}")
     file_hash = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
-    existing_thumbnails = glob.glob(os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}.*"))
-    if existing_thumbnails: return send_file(existing_thumbnails[0])
+    existing_thumb = _find_cached_thumbnail(file_hash)
+    if existing_thumb:
+        return send_file(existing_thumb, conditional=True, max_age=86400)
     print(f"WARN: Thumbnail not found for {os.path.basename(filepath)}, generating...")
     cache_path = create_thumbnail(filepath, file_hash, info['type'])
-    if cache_path and os.path.exists(cache_path): return send_file(cache_path)
+    if cache_path and os.path.exists(cache_path):
+        return send_file(cache_path, conditional=True, max_age=86400)
     return "Thumbnail generation failed", 404
+
+@app.route('/galleryout/preview/<string:file_id>')
+def serve_preview(file_id):
+    """
+    Scheme B Mid-Resolution Preview Endpoint:
+    Serves a cached 2048px JPEG/WebP (~200-400KB instead of 25-48MB 4K PNG) for Lightbox & Compare Mode.
+    Falls back cleanly to the original (or metadata-stripped) file for small images or non-image types.
+    """
+    if not is_file_accessible(file_id):
+        abort(403, description="Access Denied.")
+    info = get_file_info_from_db(file_id)
+    filepath, mtime, file_type = info['path'], info['mtime'], info['type']
+    file_hash = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
+
+    existing_prev = _find_cached_preview(file_hash)
+    if existing_prev:
+        return send_file(existing_prev, conditional=True, max_age=86400)
+
+    if _needs_preview(file_type, info.get('size') or 0, info.get('dimensions') or ''):
+        prev_path = create_preview(filepath, file_hash, file_type)
+        if prev_path and os.path.exists(prev_path):
+            return send_file(prev_path, conditional=True, max_age=86400)
+
+    if should_strip_metadata():
+        return serve_cleaned_file(file_id)
+    if filepath.lower().endswith('.webp'):
+        return send_file(filepath, mimetype='image/webp', conditional=True, max_age=86400)
+    return send_file(filepath, conditional=True, max_age=86400)
 
 # --- STORYBOARD (GRID SYSTEM) - FAST + SMART CORRUPTION DETECTION ---
 @app.route('/galleryout/storyboard/<string:file_id>')
@@ -11912,6 +12414,12 @@ if __name__ == '__main__':
         else:
             print(f"{Colors.RED}WARNING: FFmpeg not found.{Colors.RESET}")
 
+    # --- START BACKGROUND PREVIEW WARM-UP ---
+    try:
+        threading.Thread(target=_background_preview_warmup, daemon=True).start()
+    except Exception as e:
+        print(f"{Colors.YELLOW}WARN: Could not start preview warm-up thread: {e}{Colors.RESET}")
+
     # --- START BACKGROUND WATCHER ---
     # In exhibition mode, watcher might not be needed, but it's safe to run it (it reads DB config)
     if ENABLE_AI_SEARCH and not IS_EXHIBITION_MODE:
@@ -11961,9 +12469,7 @@ if __name__ == '__main__':
 
     if WAITRESS_AVAILABLE:
         # PRODUCTION MODE: Launching with Waitress WSGI Server
-        # threads=8 allows handling multiple concurrent requests (images/video thumbnails)
-        # channel_timeout avoids drops during heavy video streaming
-        print(f"{Colors.GREEN}INFO: Starting Production WSGI Server (Waitress)...{Colors.RESET}")
+        print(f"{Colors.GREEN}INFO: Starting Production WSGI Server (Waitress, threads={WAITRESS_THREADS})...{Colors.RESET}")
         # Suppress noisy Waitress internal messages such as task queue depth warnings
         import logging
         for _cq_logger_name in ('waitress', 'waitress.server', 'waitress.channel', 'waitress.task_dispatcher', 'waitress.parser', 'waitress.wasyncore'):
@@ -11971,7 +12477,7 @@ if __name__ == '__main__':
             _cq_logger.setLevel(logging.CRITICAL)
             _cq_logger.disabled = True
             _cq_logger.propagate = False
-        serve(app, host='0.0.0.0', port=SERVER_PORT, threads=8, connection_limit=150, channel_timeout=120, asyncore_use_poll=True, max_request_body_size=2147483648, _quiet=True)
+        serve(app, host='0.0.0.0', port=SERVER_PORT, threads=WAITRESS_THREADS, connection_limit=max(256, WAITRESS_THREADS * 8), channel_timeout=120, asyncore_use_poll=True, max_request_body_size=2147483648, _quiet=True)
     else:
         # DEVELOPMENT MODE: Falling back to Flask built-in server
         print(f"{Colors.YELLOW}WARNING: 'waitress' not found. Using Flask development server.{Colors.RESET}")
