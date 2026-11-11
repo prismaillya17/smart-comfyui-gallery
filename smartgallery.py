@@ -689,6 +689,8 @@ app = Flask(__name__, static_folder='templates', static_url_path='/static')
 app.secret_key = SECRET_KEY
 gallery_view_cache = []
 folder_config_cache = None
+folder_config_stamp = None
+_folder_sync_mtime = {}
 FFPROBE_EXECUTABLE_PATH = None
 
 
@@ -1578,7 +1580,10 @@ def analyze_file_metadata(filepath):
         try:
             with Image.open(filepath) as img: details['dimensions'] = f"{img.width}x{img.height}"
         except Exception: pass
-    if extract_workflow(filepath): details['has_workflow'] = 1
+    wf_found = extract_workflow(filepath, target_type='api')
+    if wf_found:
+        details['has_workflow'] = 1
+        details['workflow_json'] = wf_found
     total_duration_sec = 0
     if details['type'] == 'video':
         try:
@@ -1958,6 +1963,16 @@ def extract_workflow_prompt_string(workflow_json_string):
     # Join everything with a separator for the Database field (deterministic order)
     return " , ".join(sorted(list(found_texts)))
     
+_THUMB_EXTS = ('.jpeg', '.webp', '.gif', '.png')
+
+def _find_cached_thumbnail(file_hash):
+    """O(1) stat lookup by known extensions instead of O(N) glob.glob directory scan."""
+    for ext in _THUMB_EXTS:
+        p = os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}{ext}")
+        if os.path.exists(p):
+            return p
+    return None
+
 def process_single_file(filepath):
     """
     Worker function to perform all heavy processing for a single file.
@@ -1977,7 +1992,7 @@ def process_single_file(filepath):
 
         file_hash_for_thumbnail = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
         
-        if not glob.glob(os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash_for_thumbnail}.*")):
+        if not _find_cached_thumbnail(file_hash_for_thumbnail):
             thumb = create_thumbnail(filepath, file_hash_for_thumbnail, metadata['type'], silent=True)
             if not thumb or not os.path.exists(thumb):
                 time.sleep(0.2)
@@ -1995,7 +2010,9 @@ def process_single_file(filepath):
         pr_hash = ""
         
         if metadata['has_workflow']:
-            wf_json = extract_workflow(filepath, target_type='api')
+            wf_json = metadata.get('workflow_json')
+            if not wf_json:
+                wf_json = extract_workflow(filepath, target_type='api')
             if not wf_json:
                 wf_json = extract_workflow(filepath, target_type='ui')
             
@@ -2076,6 +2093,7 @@ def init_db(conn=None):
         ''')
         
         conn.execute('CREATE INDEX IF NOT EXISTS idx_omniquery_results ON omniquery_results(session_id);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);')
 
         conn.execute('''
             CREATE TABLE IF NOT EXISTS ai_search_queue (
@@ -2298,8 +2316,14 @@ def init_db(conn=None):
         if close_conn: conn.close()
         
 def get_dynamic_folder_config(force_refresh=False):
-    global folder_config_cache
-    if folder_config_cache is not None and not force_refresh:
+    global folder_config_cache, folder_config_stamp
+    try:
+        stamp = os.path.getmtime(BASE_OUTPUT_PATH)
+    except OSError:
+        stamp = None
+    # Root mtime changes when a top-level folder is added. New files inside an
+    # existing day folder do not, so browsing skips the full tree walk.
+    if folder_config_cache is not None and not force_refresh and stamp == folder_config_stamp:
         return folder_config_cache
 
     #print("INFO: Refreshing folder configuration by scanning directory tree...")
@@ -2443,6 +2467,7 @@ def get_dynamic_folder_config(force_refresh=False):
         print(f"Error calculating folder file counts: {e}")
 
     folder_config_cache = dynamic_config
+    folder_config_stamp = stamp
     return dynamic_config
     
 # --- BACKGROUND WATCHER THREAD ---
@@ -2739,48 +2764,147 @@ def full_sync_database(conn):
 
     print(f"INFO: Full scan completed in {time.time() - start_time:.2f} seconds.")
     
+def _folder_path_needles(folder_path):
+    """Forward-slash and backslash prefixes for an indexed path LIKE."""
+    norm = os.path.normpath(folder_path).replace('\\', '/').rstrip('/')
+    win = norm.replace('/', '\\')
+    return norm, win
+
+def count_files_in_folder(conn, folder_path, recursive):
+    norm, win = _folder_path_needles(folder_path)
+    base = "type != 'document' AND LOWER(name) NOT LIKE '%.txt' AND LOWER(name) NOT LIKE '%.md'"
+    if recursive:
+        query = f"SELECT COUNT(*) FROM files WHERE {base} AND (path LIKE ? OR path LIKE ?)"
+        params = (norm + '/%', win + '\\%')
+    else:
+        query = f"""SELECT COUNT(*) FROM files WHERE {base}
+            AND (path LIKE ? OR path LIKE ?)
+            AND path NOT LIKE ? AND path NOT LIKE ?"""
+        params = (norm + '/%', win + '\\%', norm + '/%/%', win + '\\%\\%')
+    return conn.execute(query, params).fetchone()[0]
+
+def gallery_file_columns():
+    return (
+        "f.id, f.path, f.mtime, f.name, f.type, f.duration, f.dimensions, "
+        "f.has_workflow, f.is_favorite, f.size, f.last_scanned, "
+        "f.workflow_hash, f.prompt_hash, f.ai_last_scanned, f.ai_caption, f.ai_error"
+    )
+
+def gallery_stat_subqueries(safe_uuid, comment_sub_filter):
+    return f"""
+                (
+                    SELECT c.color
+                    FROM collections c
+                    JOIN collection_files cf ON c.id = cf.collection_id
+                    WHERE cf.file_id = f.id AND c.type = 'system_flag'
+                    LIMIT 1
+                ) as status_color,
+                (SELECT AVG(rating) FROM file_ratings WHERE file_id = f.id) as avg_rating,
+                (SELECT COUNT(*) FROM file_ratings WHERE file_id = f.id) as vote_count,
+                (SELECT rating FROM file_ratings WHERE file_id = f.id AND client_uuid = '{safe_uuid}') as my_rating,
+                (SELECT COUNT(*) FROM file_comments WHERE file_id = f.id {comment_sub_filter}) as comment_count,
+                (SELECT MAX(created_at) FROM file_comments WHERE file_id = f.id {comment_sub_filter}) as latest_comment_time
+    """
+
+_folder_sync_locks = {}
+_folder_sync_locks_guard = threading.Lock()
+
+_UPSERT_FILES_SQL = """
+    INSERT INTO files (id, path, mtime, name, type, duration, dimensions, has_workflow, size, last_scanned, workflow_files, workflow_prompt, workflow_hash, prompt_hash) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        path = excluded.path,
+        name = excluded.name,
+        type = excluded.type,
+        duration = excluded.duration,
+        dimensions = excluded.dimensions,
+        has_workflow = excluded.has_workflow,
+        size = excluded.size,
+        last_scanned = excluded.last_scanned,
+        workflow_files = excluded.workflow_files,
+        workflow_prompt = excluded.workflow_prompt,
+        workflow_hash = excluded.workflow_hash,
+        prompt_hash = excluded.prompt_hash,
+        is_favorite = CASE WHEN ABS(files.mtime - excluded.mtime) > 0.1 THEN 0 ELSE files.is_favorite END,
+        ai_caption = CASE WHEN ABS(files.mtime - excluded.mtime) > 0.1 THEN NULL ELSE files.ai_caption END,
+        ai_embedding = CASE WHEN ABS(files.mtime - excluded.mtime) > 0.1 THEN NULL ELSE files.ai_embedding END,
+        ai_last_scanned = CASE WHEN ABS(files.mtime - excluded.mtime) > 0.1 THEN 0 ELSE files.ai_last_scanned END,
+        mtime = excluded.mtime
+"""
+
+def _flush_upsert_batch(batch):
+    if not batch:
+        return
+    with get_db_connection() as conn:
+        conn.executemany(_UPSERT_FILES_SQL, batch)
+        conn.commit()
+    batch.clear()
+
 def sync_folder_on_demand(folder_path):
     yield f"data: {json.dumps({'message': 'Checking folder for changes...', 'current': 0, 'total': 1})}\n\n"
-    
+
+    with _folder_sync_locks_guard:
+        folder_lock = _folder_sync_locks.setdefault(folder_path, threading.Lock())
+
+    folder_lock.acquire()
     try:
-        disk_files = {}
+        global _folder_sync_mtime
+        try:
+            dir_mtime = os.path.getmtime(folder_path)
+        except OSError:
+            dir_mtime = None
+        # Directory mtime moves when a file is created, deleted, or renamed.
+        # ComfyUI writes new files, so an unchanged directory needs no per-file stat.
+        prev_mtime = _folder_sync_mtime.get(folder_path)
+        if dir_mtime is not None and prev_mtime is not None and dir_mtime == prev_mtime:
+            yield f"data: {json.dumps({'message': 'Folder is up-to-date.', 'status': 'no_changes', 'current': 1, 'total': 1})}\n\n"
+            return
+
         valid_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.mkv', '.webm', '.mov', '.avi', '.mp3', '.wav', '.ogg', '.flac', '.txt', '.md'}
+        disk_filepaths = set()
         if os.path.isdir(folder_path):
             for name in os.listdir(folder_path):
-                filepath = os.path.join(folder_path, name)
-                if os.path.isfile(filepath) and os.path.splitext(name)[1].lower() in valid_extensions:
-                    try:
-                        if os.path.getsize(filepath) > 0:
-                            disk_files[filepath] = os.path.getmtime(filepath)
-                    except OSError:
-                        pass
-        
+                if os.path.splitext(name)[1].lower() in valid_extensions:
+                    disk_filepaths.add(os.path.join(folder_path, name))
+
         with get_db_connection() as conn:
             db_files_query = conn.execute("SELECT path, mtime FROM files WHERE path LIKE ?", (folder_path + os.sep + '%',)).fetchall()
-            db_files = {row['path']: row['mtime'] for row in db_files_query if os.path.normpath(os.path.dirname(row['path'])) == os.path.normpath(folder_path)}
-        
-        disk_filepaths = set(disk_files.keys())
-        db_filepaths = set(db_files.keys())
+            folder_norm = os.path.normpath(folder_path)
+            db_filepaths = {row['path'] for row in db_files_query if os.path.normpath(os.path.dirname(row['path'])) == folder_norm}
+
         files_to_add = disk_filepaths - db_filepaths
         files_to_delete = db_filepaths - disk_filepaths
-        files_to_update = {path for path in (disk_filepaths & db_filepaths) if int(disk_files[path]) > int(db_files[path])}
-        
+        # In-place overwrites do not change the directory mtime, so they are not
+        # visible on this path. New, deleted, and renamed files are.
+        files_to_update = set()
+        if files_to_add:
+            nonempty = set()
+            for path in files_to_add:
+                try:
+                    if os.path.isfile(path) and os.path.getsize(path) > 0:
+                        nonempty.add(path)
+                except OSError:
+                    pass
+            files_to_add = nonempty
+
         if not files_to_add and not files_to_update and not files_to_delete:
+            if dir_mtime is not None:
+                _folder_sync_mtime[folder_path] = dir_mtime
             yield f"data: {json.dumps({'message': 'Folder is up-to-date.', 'status': 'no_changes', 'current': 1, 'total': 1})}\n\n"
             return
 
         files_to_process = list(files_to_add.union(files_to_update))
         total_files = len(files_to_process)
         data_to_upsert = []
-        
+        pending_batch = []
+
         if total_files > 0:
             yield f"data: {json.dumps({'message': f'Found {total_files} new/modified file(s). Processing...', 'current': 0, 'total': total_files})}\n\n"
-            
-            # Use ThreadPoolExecutor to prevent POSIX fork deadlocks inside Waitress WSGI threads
+
             max_sync_workers = min(8, max(1, total_files))
             processed_count = 0
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_sync_workers) as executor:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_sync_workers)
+            try:
                 futures = {executor.submit(process_single_file, path): path for path in files_to_process}
                 for future in concurrent.futures.as_completed(futures):
                     path = futures[future]
@@ -2789,45 +2913,42 @@ def sync_folder_on_demand(folder_path):
                         res = future.result(timeout=25)
                         if res:
                             data_to_upsert.append(res)
+                            pending_batch.append(res)
+                            if len(pending_batch) >= 25:
+                                _flush_upsert_batch(pending_batch)
                     except Exception as err:
                         print(f"WARNING: Processing error on {os.path.basename(path)}: {err}")
-                    
-                    # Real-time progressive feedback to the client
+
                     yield f"data: {json.dumps({'message': f'Processing {processed_count}/{total_files}: {os.path.basename(path)}', 'current': processed_count, 'total': total_files})}\n\n"
+            finally:
+                try:
+                    _flush_upsert_batch(pending_batch)
+                except Exception as db_err:
+                    print(f"WARNING: Failed to flush batch on sync exit: {db_err}")
+                executor.shutdown(wait=False, cancel_futures=True)
 
-        with get_db_connection() as conn:
-            if data_to_upsert:
-                conn.executemany("""
-                    INSERT INTO files (id, path, mtime, name, type, duration, dimensions, has_workflow, size, last_scanned, workflow_files, workflow_prompt, workflow_hash, prompt_hash) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        path = excluded.path,
-                        name = excluded.name,
-                        type = excluded.type,
-                        duration = excluded.duration,
-                        dimensions = excluded.dimensions,
-                        has_workflow = excluded.has_workflow,
-                        size = excluded.size,
-                        last_scanned = excluded.last_scanned,
-                        workflow_files = excluded.workflow_files,
-                        workflow_prompt = excluded.workflow_prompt,
-                        workflow_hash = excluded.workflow_hash,
-                        prompt_hash = excluded.prompt_hash,
-                        is_favorite = CASE WHEN ABS(files.mtime - excluded.mtime) > 0.1 THEN 0 ELSE files.is_favorite END,
-                        ai_caption = CASE WHEN ABS(files.mtime - excluded.mtime) > 0.1 THEN NULL ELSE files.ai_caption END,
-                        ai_embedding = CASE WHEN ABS(files.mtime - excluded.mtime) > 0.1 THEN NULL ELSE files.ai_embedding END,
-                        ai_last_scanned = CASE WHEN ABS(files.mtime - excluded.mtime) > 0.1 THEN 0 ELSE files.ai_last_scanned END,
-                        mtime = excluded.mtime
-                """, data_to_upsert) 
-                
-            if files_to_delete:
-                del_placeholders = ','.join(['?'] * len(files_to_delete))
-                conn.execute(f"DELETE FROM files WHERE path IN ({del_placeholders})", list(files_to_delete))
+        removed_ids = []
+        if files_to_delete:
+            with get_db_connection() as conn:
+                del_list = list(files_to_delete)
+                del_placeholders = ','.join(['?'] * len(del_list))
+                removed_ids = [row['id'] for row in conn.execute(f"SELECT id FROM files WHERE path IN ({del_placeholders})", del_list).fetchall()]
+                conn.execute(f"DELETE FROM files WHERE path IN ({del_placeholders})", del_list)
+                conn.commit()
 
-            conn.commit()
+        if dir_mtime is not None:
+            try:
+                end_mtime = os.path.getmtime(folder_path)
+            except OSError:
+                end_mtime = dir_mtime
+            if end_mtime == dir_mtime:
+                _folder_sync_mtime[folder_path] = end_mtime
+            else:
+                _folder_sync_mtime.pop(folder_path, None)
 
         if data_to_upsert or files_to_delete:
-            yield f"data: {json.dumps({'message': 'Sync complete. Reloading...', 'status': 'reloading', 'current': total_files, 'total': total_files})}\n\n"
+            added_ids = [row[0] for row in data_to_upsert]
+            yield f"data: {json.dumps({'message': 'Sync complete.', 'status': 'reloading', 'current': total_files, 'total': total_files, 'added_ids': added_ids, 'removed_ids': removed_ids})}\n\n"
         else:
             yield f"data: {json.dumps({'message': 'Folder is up-to-date.', 'status': 'no_changes', 'current': total_files, 'total': total_files})}\n\n"
 
@@ -2835,6 +2956,8 @@ def sync_folder_on_demand(folder_path):
         error_message = f"Error during sync: {e}"
         print(f"ERROR: {error_message}")
         yield f"data: {json.dumps({'message': error_message, 'current': 1, 'total': 1, 'error': True})}\n\n"
+    finally:
+        folder_lock.release()
 
 def scan_folder_and_extract_options(folder_path, recursive=False):
     """
@@ -4264,7 +4387,7 @@ def gallery_view(folder_key):
         return redirect(url_for('gallery_view', folder_key='_root_'))
 
     # 5. FOLDER CONFIGURATION
-    folders = get_dynamic_folder_config(force_refresh=True)
+    folders = get_dynamic_folder_config(force_refresh=False)
     
     # If root not found or invalid key
     if folder_key not in folders:
@@ -4386,9 +4509,18 @@ def gallery_view(folder_key):
                 is_ai_search = False
 
     # --- PATH B: STANDARD VIEW / SEARCH ---
+    folder_db_count = None
     if not is_ai_search and not is_omniquery:
         with get_db_connection() as conn:
             conditions, params = ["f.type != 'document' AND LOWER(f.name) NOT LIKE '%.txt' AND LOWER(f.name) NOT LIKE '%.md'"], []
+
+            if not is_global_search:
+                norm, win = _folder_path_needles(folder_path)
+                conditions.append("(f.path LIKE ? OR f.path LIKE ?)")
+                params.extend([norm + '/%', win + '\\%'])
+                if not is_recursive:
+                    conditions.append("f.path NOT LIKE ? AND f.path NOT LIKE ?")
+                    params.extend([norm + '/%/%', win + '\\%\\%'])
 
             if search_term:
                 conditions.append("name LIKE ?")
@@ -4648,59 +4780,18 @@ def gallery_view(folder_key):
             where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             
             query = f"""
-                SELECT f.*,
-                (
-                    SELECT c.color 
-                    FROM collections c 
-                    JOIN collection_files cf ON c.id = cf.collection_id 
-                    WHERE cf.file_id = f.id AND c.type = 'system_flag' 
-                    LIMIT 1
-                ) as status_color,
-                (
-                    SELECT AVG(rating) FROM file_ratings WHERE file_id = f.id
-                ) as avg_rating,
-                (
-                    SELECT COUNT(*) FROM file_ratings WHERE file_id = f.id
-                ) as vote_count,
-            (SELECT rating FROM file_ratings WHERE file_id = f.id AND client_uuid = '{safe_uuid}') as my_rating,
-                (
-                    SELECT COUNT(*) FROM file_comments WHERE file_id = f.id {comment_sub_filter}
-                ) as comment_count,
-                (
-                    SELECT MAX(created_at) FROM file_comments WHERE file_id = f.id {comment_sub_filter}
-                ) as latest_comment_time
+                SELECT {gallery_file_columns()},
+                {gallery_stat_subqueries(safe_uuid, comment_sub_filter)}
                 FROM files f 
                 {where_clause} 
                 ORDER BY {order_clause}
             """
             
             rows = conn.execute(query, params).fetchall()
-            
-            final_files = []
-            
-            def safe_path_norm(p):
-                if not p: return ""
-                return os.path.normpath(str(p).replace('\\', '/')).replace('\\', '/').lower().rstrip('/')
-
-            target_norm = safe_path_norm(folder_path)
-            
-            for row in rows:
-                f_data = dict(row)
-                if 'ai_embedding' in f_data: del f_data['ai_embedding']
-                
-                f_path_norm = safe_path_norm(f_data['path'])
-                f_dir_norm = safe_path_norm(os.path.dirname(f_path_norm))
-                
-                if is_global_search:
-                    final_files.append(f_data)
-                elif is_recursive:
-                    if f_path_norm.startswith(target_norm + '/'):
-                        final_files.append(f_data)
-                else:
-                    if f_dir_norm == target_norm:
-                        final_files.append(f_data)
-            
+            final_files = [dict(row) for row in rows]
             gallery_view_cache = final_files
+            if not is_global_search:
+                folder_db_count = count_files_in_folder(conn, folder_path, is_recursive)
 
     active_filters_count = 0
     if search_term: active_filters_count += 1
@@ -4727,7 +4818,7 @@ def gallery_view(folder_key):
     
     gallery_view_cache = process_clustering(gallery_view_cache, cluster_mode, cluster_sort, cluster_target_id, cluster_scope, active_filters_count)
 
-    total_folder_files, _, _ = scan_folder_and_extract_options(folder_path, recursive=is_recursive)
+    total_folder_files = folder_db_count if folder_db_count is not None else len(gallery_view_cache)
     total_db_files = 0 
     with get_db_connection() as conn_opts:
         try:
@@ -5589,6 +5680,60 @@ def load_more():
     if offset >= len(gallery_view_cache): return jsonify(files=[])
     return jsonify(files=gallery_view_cache[offset:offset + PAGE_SIZE])
 
+@app.route('/galleryout/api/files_brief', methods=['POST'])
+def files_brief():
+    """Card data for files just synced, without reloading the page."""
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'files': []}), 401
+    data = request.json or {}
+    raw_ids = data.get('ids') or []
+    if not isinstance(raw_ids, list):
+        return jsonify({'files': []}), 400
+    ids = [str(i) for i in raw_ids[:80] if isinstance(i, str) and 1 <= len(i) <= 64]
+    removed = data.get('removed_ids') or []
+    if not isinstance(removed, list):
+        removed = []
+    removed = {str(i) for i in removed[:500] if isinstance(i, str)}
+
+    global gallery_view_cache
+    if removed:
+        gallery_view_cache = [f for f in gallery_view_cache if f.get('id') not in removed]
+    if not ids:
+        return jsonify({'files': []})
+
+    user_role = session.get('role', 'GUEST')
+    safe_uuid = str(session.get('user_id', '')).replace("'", "''")
+    is_local_admin = (not FORCE_LOGIN and not IS_EXHIBITION_MODE)
+    if is_local_admin or user_role in ['ADMIN', 'MANAGER', 'STAFF']:
+        comment_sub_filter = ""
+    else:
+        comment_sub_filter = f" AND (target_audience = 'public' OR target_audience = 'user:{safe_uuid}' OR client_uuid = '{safe_uuid}')"
+
+    placeholders = ','.join(['?'] * len(ids))
+    query = f"""
+        SELECT {gallery_file_columns()},
+        {gallery_stat_subqueries(safe_uuid, comment_sub_filter)}
+        FROM files f
+        WHERE f.id IN ({placeholders})
+    """
+    with get_db_connection() as conn:
+        rows = [dict(r) for r in conn.execute(query, ids).fetchall()]
+    rows.sort(key=lambda r: r.get('mtime') or 0, reverse=True)
+
+    sort_by = data.get('sort_by') or 'date'
+    sort_order = data.get('sort_order') or 'desc'
+    if sort_by == 'date' and str(sort_order).lower() != 'asc' and rows:
+        same_folder = True
+        if gallery_view_cache:
+            cached_dir = os.path.normpath(os.path.dirname(gallery_view_cache[0].get('path') or '')).replace('\\', '/').lower()
+            new_dir = os.path.normpath(os.path.dirname(rows[0].get('path') or '')).replace('\\', '/').lower()
+            same_folder = cached_dir == new_dir
+        if same_folder:
+            existing = {f.get('id') for f in gallery_view_cache}
+            fresh = [r for r in rows if r.get('id') not in existing]
+            gallery_view_cache = fresh + gallery_view_cache
+    return jsonify({'files': rows})
+
 def get_file_info_from_db(file_id, column='*'):
     with get_db_connection() as conn:
         row = conn.execute(f"SELECT {column} FROM files WHERE id = ?", (file_id,)).fetchone()
@@ -6316,8 +6461,8 @@ def serve_thumbnail(file_id):
     info = get_file_info_from_db(file_id)
     filepath, mtime = info['path'], info['mtime']
     file_hash = hashlib.md5((filepath + str(mtime)).encode()).hexdigest()
-    existing_thumbnails = glob.glob(os.path.join(THUMBNAIL_CACHE_DIR, f"{file_hash}.*"))
-    if existing_thumbnails: return send_file(existing_thumbnails[0])
+    existing_thumb = _find_cached_thumbnail(file_hash)
+    if existing_thumb: return send_file(existing_thumb)
     print(f"WARN: Thumbnail not found for {os.path.basename(filepath)}, generating...")
     cache_path = create_thumbnail(filepath, file_hash, info['type'])
     if cache_path and os.path.exists(cache_path): return send_file(cache_path)

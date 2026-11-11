@@ -3399,12 +3399,17 @@ document.addEventListener('focusout', function(e) {
                     if (data.status === 'no_changes') { 
                         if (isManualRefresh && !isSilent) { 
                             syncProgressFill.style.width = '100%'; 
-                            cleanupAndClose(true);
-                        } else {
-                            cleanupAndClose(false); 
                         }
-                    } else if (data.status === 'reloading') { 
-                        cleanupAndClose(true); 
+                        cleanupAndClose(false); 
+                    } else if (data.status === 'reloading') {
+                        const addedIds = data.added_ids || [];
+                        const removedIds = data.removed_ids || [];
+                        if (!silentRefreshShouldReload() && addedIds.length <= 80) {
+                            cleanupAndClose(false);
+                            applySilentDelta(addedIds, removedIds);
+                        } else {
+                            cleanupAndClose(true);
+                        }
                     } else if (data.error) { 
                         if(!isSilent) syncProgressFill.style.backgroundColor = 'var(--danger-color)'; 
                         cleanupAndClose(false); 
@@ -3586,6 +3591,80 @@ document.addEventListener('focusout', function(e) {
         
         function formatBytes(bytes, decimals = 1) { if (!bytes) return '0 B'; const k = 1024; const dm = decimals < 0 ? 0 : decimals; const sizes = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.floor(Math.log(bytes) / Math.log(k)); return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i]; }
         function appendFiles(files) { if (typeof resetClusterColorMap === 'function' && currentItemCount === 0) resetClusterColorMap(); if (!files || files.length === 0) { if (currentItemCount === 0) showEmptyState(); updateLoadMoreVisibility(); return; } const fragment = document.createDocumentFragment(); const newLazyElements = []; files.forEach(file => { allFilesData.push(file); const item = createGalleryItem(file); fragment.appendChild(item); galleryItems.push(item); const lazyEl = item.querySelector('.lazy'); if (lazyEl) newLazyElements.push(lazyEl); }); galleryContainer.appendChild(fragment); initializeLazyLoading(newLazyElements); currentItemCount += files.length; updateLoadMoreVisibility(); }
+        function silentRefreshShouldReload() {
+            const p = new URLSearchParams(window.location.search);
+            const blockers = ['search','workflow_files','workflow_prompt','comment_search','start_date','end_date','extension','prefix','rated_by','rating_range','favorites','no_workflow','no_ai_caption','ai_session_id','omniquery_id','cluster_mode'];
+            for (const key of blockers) {
+                if (p.get(key)) return true;
+            }
+            if ((p.get('scope') || '') === 'global') return true;
+            if ((p.get('sort_by') || 'date') !== 'date') return true;
+            if ((p.get('sort_order') || 'desc') !== 'desc') return true;
+            return false;
+        }
+        function prependFiles(files) {
+            if (!files || files.length === 0) return 0;
+            const existing = new Set(allFilesData.map(f => f.id));
+            files = files.filter(f => f && f.id && !existing.has(f.id));
+            if (files.length === 0) return 0;
+            const empty = galleryContainer.querySelector('.empty-state');
+            if (empty) empty.remove();
+            const fragment = document.createDocumentFragment();
+            const newLazyElements = [];
+            const items = [];
+            files.forEach(file => {
+                const item = createGalleryItem(file);
+                fragment.appendChild(item);
+                items.push(item);
+                const lazyEl = item.querySelector('.lazy');
+                if (lazyEl) newLazyElements.push(lazyEl);
+            });
+            galleryContainer.insertBefore(fragment, galleryContainer.firstChild);
+            allFilesData = files.concat(allFilesData);
+            galleryItems = items.concat(galleryItems);
+            if (focusedItemIndex >= 0) focusedItemIndex += files.length;
+            initializeLazyLoading(newLazyElements);
+            currentItemCount += files.length;
+            totalFiles += files.length;
+            totalFolderFiles += files.length;
+            updateLoadMoreVisibility();
+            updateFileCountBadge();
+            return files.length;
+        }
+        function removeFilesByIds(ids) {
+            if (!ids || ids.length === 0) return;
+            const drop = new Set(ids);
+            let domRemoved = 0;
+            drop.forEach(id => {
+                const el = galleryContainer.querySelector(`.gallery-item[data-file-id="${id}"]`);
+                if (el) { el.remove(); domRemoved++; }
+            });
+            allFilesData = allFilesData.filter(f => !drop.has(f.id));
+            galleryItems = galleryItems.filter(el => el.isConnected);
+            currentItemCount = Math.max(0, currentItemCount - domRemoved);
+            totalFiles = Math.max(0, totalFiles - drop.size);
+            totalFolderFiles = Math.max(0, totalFolderFiles - drop.size);
+            if (focusedItemIndex >= galleryItems.length) focusedItemIndex = galleryItems.length - 1;
+            updateLoadMoreVisibility();
+            updateFileCountBadge();
+            if (currentItemCount === 0) showEmptyState();
+        }
+        function applySilentDelta(addedIds, removedIds) {
+            const p = new URLSearchParams(window.location.search);
+            fetch('/galleryout/api/files_brief', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    ids: addedIds || [],
+                    removed_ids: removedIds || [],
+                    sort_by: p.get('sort_by') || 'date',
+                    sort_order: p.get('sort_order') || 'desc'
+                })
+            }).then(r => r.json()).then(data => {
+                if (removedIds && removedIds.length) removeFilesByIds(removedIds);
+                prependFiles((data && data.files) || []);
+            }).catch(() => { window.location.reload(); });
+        }
         function createGalleryItem(file) {
             const item = document.createElement('div');
             item.className = `gallery-item ${selectedFiles.has(file.id) ? 'selected' : ''}`;
