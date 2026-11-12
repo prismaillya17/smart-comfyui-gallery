@@ -9,6 +9,11 @@
     <link rel="icon" type="image/png" href="{{ app_logo_b64 }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/index.css', v='2.24.1') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/collections.css', v='2.24.1') }}">
+    <style>
+        body:not(.list-view-active) .thumbnail-wrapper img.lazy {
+            min-height: 80px;
+        }
+    </style>
 
 <script>
 // --- EARLY INSTANT ESC KEY LISTENER FOR CLUSTERING EXIT (MAC & SAFARI OPTIMIZED) ---
@@ -2595,6 +2600,10 @@ document.addEventListener('focusout', function(e) {
         const loaderOverlay = document.getElementById('loader-overlay');
         const backToTopBtn = document.getElementById('backToTopBtn');
         let currentItemCount = 0;
+        let nextLoadOffset = 0;
+        let hasMoreFiles = totalFiles > 0;
+        let isLoadingMore = false;
+        const loadedFileIds = new Set();
         let galleryItems = [];
         let allFilesData = [];
         const selectedFiles = new Set();
@@ -3591,8 +3600,59 @@ document.addEventListener('focusout', function(e) {
             }
         }
         
+        function buildViewApiQuery(extraParams = {}) {
+            const params = new URLSearchParams(window.location.search);
+            params.set('folder_key', currentFolderKey);
+            Object.entries(extraParams).forEach(([k, v]) => {
+                if (v !== undefined && v !== null) params.set(k, String(v));
+            });
+            return params.toString();
+        }
         function formatBytes(bytes, decimals = 1) { if (!bytes) return '0 B'; const k = 1024; const dm = decimals < 0 ? 0 : decimals; const sizes = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.floor(Math.log(bytes) / Math.log(k)); return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i]; }
-        function appendFiles(files) { if (typeof resetClusterColorMap === 'function' && currentItemCount === 0) resetClusterColorMap(); if (!files || files.length === 0) { if (currentItemCount === 0) showEmptyState(); updateLoadMoreVisibility(); return; } const fragment = document.createDocumentFragment(); const newLazyElements = []; files.forEach(file => { allFilesData.push(file); const item = createGalleryItem(file); fragment.appendChild(item); galleryItems.push(item); const lazyEl = item.querySelector('.lazy'); if (lazyEl) newLazyElements.push(lazyEl); }); galleryContainer.appendChild(fragment); initializeLazyLoading(newLazyElements); currentItemCount += files.length; updateLoadMoreVisibility(); }
+        function appendFiles(files, options = {}) {
+            if (typeof resetClusterColorMap === 'function' && currentItemCount === 0) resetClusterColorMap();
+            if (!files || files.length === 0) {
+                if (typeof options.nextOffset === 'number') nextLoadOffset = options.nextOffset;
+                if (typeof options.hasMore === 'boolean') hasMoreFiles = options.hasMore;
+                else hasMoreFiles = false;
+                if (currentItemCount === 0) showEmptyState();
+                updateLoadMoreVisibility();
+                return 0;
+            }
+            const empty = galleryContainer.querySelector('.empty-state');
+            if (empty) empty.remove();
+            const fragment = document.createDocumentFragment();
+            const newLazyElements = [];
+            let addedCount = 0;
+            files.forEach(file => {
+                if (!file || !file.id || loadedFileIds.has(file.id)) return;
+                loadedFileIds.add(file.id);
+                allFilesData.push(file);
+                const item = createGalleryItem(file);
+                fragment.appendChild(item);
+                galleryItems.push(item);
+                const lazyEl = item.querySelector('.lazy');
+                if (lazyEl) newLazyElements.push(lazyEl);
+                addedCount++;
+            });
+            if (addedCount > 0) {
+                galleryContainer.appendChild(fragment);
+                initializeLazyLoading(newLazyElements);
+                currentItemCount += addedCount;
+            }
+            if (typeof options.nextOffset === 'number') {
+                nextLoadOffset = options.nextOffset;
+            } else {
+                nextLoadOffset += files.length;
+            }
+            if (typeof options.hasMore === 'boolean') {
+                hasMoreFiles = options.hasMore;
+            } else {
+                hasMoreFiles = nextLoadOffset < totalFiles && currentItemCount < totalFiles;
+            }
+            updateLoadMoreVisibility();
+            return addedCount;
+        }
         function silentRefreshShouldReload() {
             const p = new URLSearchParams(window.location.search);
             const blockers = ['search','workflow_files','workflow_prompt','comment_search','start_date','end_date','extension','prefix','rated_by','rating_range','favorites','no_workflow','no_ai_caption','ai_session_id','omniquery_id','cluster_mode'];
@@ -3606,8 +3666,7 @@ document.addEventListener('focusout', function(e) {
         }
         function prependFiles(files) {
             if (!files || files.length === 0) return 0;
-            const existing = new Set(allFilesData.map(f => f.id));
-            files = files.filter(f => f && f.id && !existing.has(f.id));
+            files = files.filter(f => f && f.id && !loadedFileIds.has(f.id));
             if (files.length === 0) return 0;
             const empty = galleryContainer.querySelector('.empty-state');
             if (empty) empty.remove();
@@ -3615,6 +3674,7 @@ document.addEventListener('focusout', function(e) {
             const newLazyElements = [];
             const items = [];
             files.forEach(file => {
+                loadedFileIds.add(file.id);
                 const item = createGalleryItem(file);
                 fragment.appendChild(item);
                 items.push(item);
@@ -3627,8 +3687,14 @@ document.addEventListener('focusout', function(e) {
             if (focusedItemIndex >= 0) focusedItemIndex += files.length;
             initializeLazyLoading(newLazyElements);
             currentItemCount += files.length;
+            nextLoadOffset += files.length;
             totalFiles += files.length;
             totalFolderFiles += files.length;
+            hasMoreFiles = nextLoadOffset < totalFiles && currentItemCount < totalFiles;
+            if (foldersData && foldersData[currentFolderKey] && !GLOBAL_VIEW_IS_COLLECTION) {
+                foldersData[currentFolderKey].file_count = totalFolderFiles;
+                renderAllTrees();
+            }
             updateLoadMoreVisibility();
             updateFileCountBadge();
             return files.length;
@@ -3638,18 +3704,25 @@ document.addEventListener('focusout', function(e) {
             const drop = new Set(ids);
             let domRemoved = 0;
             drop.forEach(id => {
+                loadedFileIds.delete(id);
                 const el = galleryContainer.querySelector(`.gallery-item[data-file-id="${id}"]`);
                 if (el) { el.remove(); domRemoved++; }
             });
             allFilesData = allFilesData.filter(f => !drop.has(f.id));
             galleryItems = galleryItems.filter(el => el.isConnected);
             currentItemCount = Math.max(0, currentItemCount - domRemoved);
+            nextLoadOffset = Math.max(0, nextLoadOffset - domRemoved);
             totalFiles = Math.max(0, totalFiles - drop.size);
             totalFolderFiles = Math.max(0, totalFolderFiles - drop.size);
+            hasMoreFiles = nextLoadOffset < totalFiles && currentItemCount < totalFiles;
+            if (foldersData && foldersData[currentFolderKey] && !GLOBAL_VIEW_IS_COLLECTION) {
+                foldersData[currentFolderKey].file_count = totalFolderFiles;
+                renderAllTrees();
+            }
             if (focusedItemIndex >= galleryItems.length) focusedItemIndex = galleryItems.length - 1;
             updateLoadMoreVisibility();
             updateFileCountBadge();
-            if (currentItemCount === 0) showEmptyState();
+            if (currentItemCount === 0 && !hasMoreFiles) showEmptyState();
         }
         function applySilentDelta(addedIds, removedIds) {
             const p = new URLSearchParams(window.location.search);
@@ -3657,6 +3730,7 @@ document.addEventListener('focusout', function(e) {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
+                    folder_key: currentFolderKey,
                     ids: addedIds || [],
                     removed_ids: removedIds || [],
                     sort_by: p.get('sort_by') || 'date',
@@ -3691,7 +3765,14 @@ document.addEventListener('focusout', function(e) {
                 mediaHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:4rem;color:#1ed760;">🎵</div>`;
             } else if (['image', 'animated_image'].includes(file.type)) {
                 const thumbVer = Math.floor(file.mtime || 0);
-                mediaHTML = `<img class="lazy" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3C/svg%3E" data-src="/galleryout/thumbnail/${file.id}?v=${thumbVer}" alt="${file.name}" loading="lazy" decoding="async">`;
+                let aspectStyle = '';
+                if (file.dimensions && file.dimensions.indexOf('x') !== -1) {
+                    const [dw, dh] = file.dimensions.split('x').map(n => parseInt(n, 10) || 0);
+                    if (dw > 0 && dh > 0) {
+                        aspectStyle = ` style="aspect-ratio: ${dw} / ${dh};"`;
+                    }
+                }
+                mediaHTML = `<img class="lazy"${aspectStyle} src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3C/svg%3E" data-src="/galleryout/thumbnail/${file.id}?v=${thumbVer}" alt="${file.name}" decoding="async" onerror="if(!this.dataset.retried&&!this.dataset.src){this.dataset.retried='1';const u=this.getAttribute('src');if(u&&u.startsWith('/galleryout/')){setTimeout(()=>{this.src=u+(u.includes('?')?'&':'?')+'retry=1';},400);}}">`;
             } else if (file.type === 'document') {
                 mediaEl = document.createElement('div');
                 mediaEl.className = 'theater-document-reader';
@@ -3954,7 +4035,12 @@ document.addEventListener('focusout', function(e) {
             
             return item;
         }
-        function updateLoadMoreVisibility() { const loadMoreContainer = document.getElementById('load-more-container'); if (!loadMoreContainer) return; const shouldHide = currentItemCount >= totalFiles || totalFiles === 0; loadMoreContainer.style.display = shouldHide ? 'none' : 'block'; }
+        function updateLoadMoreVisibility() {
+            const loadMoreContainer = document.getElementById('load-more-container');
+            if (!loadMoreContainer) return;
+            const shouldHide = !hasMoreFiles || totalFiles === 0 || (currentItemCount >= totalFiles && nextLoadOffset >= totalFiles);
+            loadMoreContainer.style.display = shouldHide ? 'none' : 'flex';
+        }
         function updateFileCountBadge() { 
             // Update all present badges (desktop and mobile)
             document.querySelectorAll('.file-count-badge').forEach(badge => {
@@ -4028,60 +4114,58 @@ document.addEventListener('focusout', function(e) {
             
             galleryContainer.innerHTML = htmlContent; 
         }
-        function initializeLazyLoading(elements) {
-            const observer = new IntersectionObserver((entries) => {
-                entries.forEach(entry => {
-                    const el = entry.target;
-                    
-                    // Handle Images (Keep original simple logic: load once)
-                    if (el.tagName === 'IMG') {
-                        if (entry.isIntersecting) {
-                            if (el.dataset.src) {
-                                el.src = el.dataset.src;
-                                el.removeAttribute('data-src');
-                            }
-                            el.classList.remove("lazy");
-                            observer.unobserve(el); // Images are done once loaded
-                        }
-                        return;
-                    }
+        function getSharedMediaLazyObserver() {
+            if (!window._sgMediaLazyObserver) {
+                window._sgMediaLazyObserver = new IntersectionObserver((entries, obs) => {
+                    entries.forEach(entry => {
+                        const el = entry.target;
 
-                    // Handle Videos (Smart Play/Pause logic)
-                    if (el.tagName === 'VIDEO') {
-                        if (entry.isIntersecting) {
-                            // 1. Load source if not loaded yet
-                            if (el.dataset.src) {
-                                el.src = el.dataset.src;
-                                // If Autoplay is OFF (Click-to-play), we DON'T call load() aggressively 
-                                // unless user interacts, but setting src usually triggers loading metadata.
-                                // With preload="none", it should be fine.
-                                if (videoAutoplay) el.load(); 
-                                el.removeAttribute('data-src');
+                        // Handle Images (load once as soon as approaching viewport)
+                        if (el.tagName === 'IMG') {
+                            if (entry.isIntersecting) {
+                                if (el.dataset.src) {
+                                    el.src = el.dataset.src;
+                                    el.removeAttribute('data-src');
+                                }
                                 el.classList.remove("lazy");
+                                obs.unobserve(el);
                             }
-                            
-                            // 2. Play when visible ONLY if preference is ON
-                            if (videoAutoplay) {
-                                const playPromise = el.play();
-                                if (playPromise !== undefined) {
-                                    playPromise.catch(error => { console.log("Autoplay prevented:", error); });
+                            return;
+                        }
+
+                        // Handle Videos (Smart Play/Pause logic)
+                        if (el.tagName === 'VIDEO') {
+                            if (entry.isIntersecting) {
+                                if (el.dataset.src) {
+                                    el.src = el.dataset.src;
+                                    if (videoAutoplay) el.load();
+                                    el.removeAttribute('data-src');
+                                    el.classList.remove("lazy");
+                                }
+                                if (videoAutoplay) {
+                                    const playPromise = el.play();
+                                    if (playPromise !== undefined) {
+                                        playPromise.catch(error => { console.log("Autoplay prevented:", error); });
+                                    }
+                                }
+                            } else {
+                                if (!el.paused && !el.dataset.src) {
+                                    el.pause();
                                 }
                             }
-                        } else {
-                            // 3. Pause when out of viewport to save resources
-                            if (!el.paused && !el.dataset.src) {
-                                el.pause();
-                            }
                         }
-                        // Do NOT unobserve video! We need to check it continuously.
-                    }
+                    });
+                }, {
+                    root: null,
+                    rootMargin: '500px 0px',
+                    threshold: 0
                 });
-            }, {
-                root: null,
-                rootMargin: '50px', // Preload slightly before appearing
-                threshold: 0.2      // Trigger when 20% visible
-            });
-
+            }
+            return window._sgMediaLazyObserver;
+        }
+        function initializeLazyLoading(elements) {
+            if (!elements || elements.length === 0) return;
+            const observer = getSharedMediaLazyObserver();
             elements.forEach(el => observer.observe(el));
         }
         async function createFolder() {
@@ -4442,7 +4526,7 @@ document.addEventListener('focusout', function(e) {
                 const btns = document.querySelectorAll('.toggle-select-all-btn');
                 btns.forEach(b => b.innerHTML = "⏳...");
 
-                const res = await fetch('/galleryout/api/current_view_ids');
+                const res = await fetch(`/galleryout/api/current_view_ids?${buildViewApiQuery()}`);
                 const data = await res.json();
                 
                 if (data.status === 'success') {
@@ -4625,15 +4709,22 @@ document.addEventListener('focusout', function(e) {
                         
                         setTimeout(() => {
                             item.remove();
+                            loadedFileIds.delete(fileId);
                             galleryItems = galleryItems.filter(gi => gi !== item);
                             allFilesData = allFilesData.filter(f => f.id !== fileId);
                             selectedFiles.delete(fileId);
                             updateSelectionUI();
                             
                             // UPDATE GLOBAL COUNTERS PROPERLY
-                            currentItemCount--;
-                            totalFiles--;
-                            totalFolderFiles--;
+                            currentItemCount = Math.max(0, currentItemCount - 1);
+                            nextLoadOffset = Math.max(0, nextLoadOffset - 1);
+                            totalFiles = Math.max(0, totalFiles - 1);
+                            totalFolderFiles = Math.max(0, totalFolderFiles - 1);
+                            hasMoreFiles = nextLoadOffset < totalFiles && currentItemCount < totalFiles;
+                            if (foldersData && foldersData[currentFolderKey] && !GLOBAL_VIEW_IS_COLLECTION) {
+                                foldersData[currentFolderKey].file_count = totalFolderFiles;
+                                renderAllTrees();
+                            }
                             
                             updateFileCountBadge();
                             updateLoadMoreVisibility();
@@ -5218,6 +5309,9 @@ document.addEventListener('focusout', function(e) {
         function showItemAtIndex(index) {
             const item = galleryItems[index];
             if (!item) return;
+            if (hasMoreFiles && !isLoadingMore && index >= galleryItems.length - 8 && typeof window.loadMoreFiles === 'function') {
+                window.loadMoreFiles();
+            }
             
             const file = allFilesData.find(f => f.id === item.dataset.fileId);
             if (!file) return;
@@ -5619,7 +5713,20 @@ document.addEventListener('focusout', function(e) {
             }
         }
         
-        function navigateLightbox(direction) { if (galleryItems.length === 0) return; currentLightboxIndex = (currentLightboxIndex + direction + galleryItems.length) % galleryItems.length; showItemAtIndex(currentLightboxIndex); }
+        async function navigateLightbox(direction) {
+            if (galleryItems.length === 0) return;
+            if (direction > 0 && currentLightboxIndex + direction >= galleryItems.length && hasMoreFiles && typeof window.loadMoreFiles === 'function') {
+                const prevLen = galleryItems.length;
+                await window.loadMoreFiles();
+                if (galleryItems.length > prevLen) {
+                    currentLightboxIndex = prevLen;
+                    showItemAtIndex(currentLightboxIndex);
+                    return;
+                }
+            }
+            currentLightboxIndex = (currentLightboxIndex + direction + galleryItems.length) % galleryItems.length;
+            showItemAtIndex(currentLightboxIndex);
+        }
         function zoomLightbox(amount) { const mediaEl = lightboxMedia.querySelector('img, video'); if (!mediaEl) return; currentZoom = Math.max(0.1, Math.min(10, currentZoom + amount)); panLightbox(0, 0); }
         function panLightbox(dx, dy) {
             const mediaEl = lightboxMedia.querySelector('img, video');
@@ -5718,15 +5825,23 @@ document.addEventListener('focusout', function(e) {
                     if (ok && data.status === 'success') {
                         showNotification(data.message || 'File deleted!', 'success');
                         itemToDelete.remove();
+                        loadedFileIds.delete(fileId);
                         galleryItems.splice(currentLightboxIndex, 1);
                         allFilesData = allFilesData.filter(f => f.id !== fileId);
                         
                         // UPDATE GLOBAL COUNTERS PROPERLY
-                        currentItemCount--;
-                        totalFiles--;
-                        totalFolderFiles--;
+                        currentItemCount = Math.max(0, currentItemCount - 1);
+                        nextLoadOffset = Math.max(0, nextLoadOffset - 1);
+                        totalFiles = Math.max(0, totalFiles - 1);
+                        totalFolderFiles = Math.max(0, totalFolderFiles - 1);
+                        hasMoreFiles = nextLoadOffset < totalFiles && currentItemCount < totalFiles;
+                        if (foldersData && foldersData[currentFolderKey] && !GLOBAL_VIEW_IS_COLLECTION) {
+                            foldersData[currentFolderKey].file_count = totalFolderFiles;
+                            renderAllTrees();
+                        }
                         
                         updateFileCountBadge();
+                        updateLoadMoreVisibility();
                         
                         if (galleryItems.length === 0) {
                             closeLightbox();
@@ -5778,6 +5893,8 @@ document.addEventListener('focusout', function(e) {
                     const newId = data.new_id;
 
                     // Update local data
+                    loadedFileIds.delete(fileId);
+                    loadedFileIds.add(newId);
                     const fileIndexInData = allFilesData.findIndex(f => f.id === fileId);
                     if (fileIndexInData !== -1) {
                         allFilesData[fileIndexInData].name = data.new_name;
@@ -8458,6 +8575,9 @@ document.addEventListener('focusout', function(e) {
 
                 if (newIndex < 0) newIndex = 0;
                 if (newIndex >= galleryItems.length) newIndex = galleryItems.length - 1;
+                if (delta > 0 && hasMoreFiles && !isLoadingMore && newIndex >= galleryItems.length - 8 && typeof window.loadMoreFiles === 'function') {
+                    window.loadMoreFiles();
+                }
 
                 if (newIndex !== focusedItemIndex) {
                     if (focusedItemIndex !== -1 && galleryItems[focusedItemIndex]) {
@@ -8485,66 +8605,109 @@ document.addEventListener('focusout', function(e) {
             const loadMoreBtn = document.getElementById('load-more-btn');
             const loadMoreContainer = document.getElementById('load-more-container');
 
-            if (loadMoreBtn) {
-                // 1. Click Handler (Original Logic)
-                loadMoreBtn.addEventListener('click', async function () {
-                    if (this.disabled) return; // Prevent double firing
-                    
-                    this.disabled = true;
-                    
-                    // [FIX] Update text span only, preserve SVG icon
-                    const textSpan = this.querySelector('span');
-                    const originalText = textSpan ? textSpan.textContent : 'Load More';
-                    if (textSpan) textSpan.textContent = 'Loading...';
-                    
-                    try {
-                        let fetchUrl = `/galleryout/load_more?offset=${currentItemCount}&folder_key=${currentFolderKey}`;
-                        
-                        const filterForm = document.querySelector('#filter-form');
-                        if (filterForm) {
-                            fetchUrl += `&${new URLSearchParams(new FormData(filterForm))}`;
-                        }
-                        
+            function checkAndTriggerInfiniteScroll() {
+                if (isLoadingMore || !hasMoreFiles) return;
+                if (!loadMoreContainer || loadMoreContainer.style.display === 'none') return;
+                const rect = loadMoreContainer.getBoundingClientRect();
+                const viewportH = window.innerHeight || document.documentElement.clientHeight || 900;
+                if (rect.top <= viewportH + 600) {
+                    window.loadMoreFiles();
+                }
+            }
+
+            window.loadMoreFiles = async function () {
+                if (isLoadingMore || !hasMoreFiles) return 0;
+                isLoadingMore = true;
+                if (loadMoreBtn) loadMoreBtn.disabled = true;
+
+                const textSpan = loadMoreBtn ? loadMoreBtn.querySelector('span') : null;
+                const defaultLabel = 'Load More / Scroll Down';
+                if (textSpan) textSpan.textContent = 'Loading...';
+
+                let totalAdded = 0;
+                let fetchFailed = false;
+                try {
+                    let guard = 0;
+                    while (guard < 3 && hasMoreFiles && totalAdded === 0) {
+                        guard++;
+                        const fetchUrl = `/galleryout/load_more?${buildViewApiQuery({ offset: nextLoadOffset })}`;
                         const response = await fetch(fetchUrl);
-                        const data = await response.json();
-                        
-                        if (data.files && data.files.length > 0) {
-                            appendFiles(data.files);
-                        } else {
-                            // No more files: hide container and disconnect observer
-                            // showNotification('No more files to load.', 'info'); // Optional: usually distracting on infinite scroll
-                            if (loadMoreContainer) loadMoreContainer.style.display = 'none';
+                        if (!response.ok) {
+                            throw new Error(`Load more failed (HTTP ${response.status})`);
                         }
-                    } catch (error) {
-                        handleError(error);
+                        const data = await response.json();
+                        if (typeof data.total_files === 'number' && data.total_files >= 0 && data.total_files !== totalFiles) {
+                            const delta = data.total_files - totalFiles;
+                            totalFiles = data.total_files;
+                            if (activeFiltersCount === 0 && !isAiSearch && !isGlobalSearch && (typeof isOmniQuery === 'undefined' || !isOmniQuery)) {
+                                totalFolderFiles = Math.max(totalFiles, totalFolderFiles + delta);
+                                if (foldersData && foldersData[currentFolderKey] && !GLOBAL_VIEW_IS_COLLECTION) {
+                                    foldersData[currentFolderKey].file_count = totalFolderFiles;
+                                    renderAllTrees();
+                                }
+                            }
+                            updateFileCountBadge();
+                        }
+                        const batch = Array.isArray(data.files) ? data.files : [];
+                        const nextOff = (typeof data.next_offset === 'number') ? data.next_offset : (nextLoadOffset + batch.length);
+                        const moreFlag = (typeof data.has_more === 'boolean') ? data.has_more : (batch.length > 0 && nextOff < totalFiles);
+                        if (batch.length > 0) {
+                            totalAdded += appendFiles(batch, { nextOffset: nextOff, hasMore: moreFlag });
+                        } else {
+                            nextLoadOffset = nextOff;
+                            hasMoreFiles = false;
+                            updateLoadMoreVisibility();
+                            break;
+                        }
                     }
-                    
-                    if (currentItemCount < totalFiles) {
-                        this.disabled = false;
-                        // [FIX] Restore original text
-                        if (textSpan) textSpan.textContent = originalText;
-                    } else {
-                        if (loadMoreContainer) loadMoreContainer.style.display = 'none';
+                } catch (error) {
+                    fetchFailed = true;
+                    console.error('Infinite Scroll / Load More error:', error);
+                    showNotification(error.message || 'Network error while loading more items.', 'warning', 3000);
+                } finally {
+                    isLoadingMore = false;
+                    if (loadMoreBtn) {
+                        loadMoreBtn.disabled = false;
+                        if (textSpan) textSpan.textContent = fetchFailed ? 'Retry Load More' : defaultLabel;
                     }
+                    updateLoadMoreVisibility();
+                    if (!fetchFailed && hasMoreFiles) {
+                        requestAnimationFrame(checkAndTriggerInfiniteScroll);
+                    }
+                }
+                return totalAdded;
+            };
+
+            if (loadMoreBtn) {
+                loadMoreBtn.addEventListener('click', () => {
+                    window.loadMoreFiles();
                 });
 
-                // 2. Infinite Scroll Observer
-                // Triggers the click automatically when the button comes into view
                 if (loadMoreContainer) {
                     const scrollObserver = new IntersectionObserver((entries) => {
                         const entry = entries[0];
-                        // If visible AND not already loading AND container is not hidden
-                        if (entry.isIntersecting && !loadMoreBtn.disabled && loadMoreContainer.style.display !== 'none') {
-                            console.log("Infinite Scroll: Triggering load more...");
-                            loadMoreBtn.click();
+                        if (entry && entry.isIntersecting && !isLoadingMore && hasMoreFiles && loadMoreContainer.style.display !== 'none') {
+                            window.loadMoreFiles();
                         }
                     }, {
-                        root: null, // Viewport
-                        rootMargin: '300px', // Trigger loading 300px BEFORE reaching the bottom for smoothness
-                        threshold: 0.1
+                        root: null,
+                        rootMargin: '600px 0px',
+                        threshold: 0
                     });
-                    
                     scrollObserver.observe(loadMoreContainer);
+
+                    let scrollTicking = false;
+                    const onScrollOrResize = () => {
+                        if (scrollTicking) return;
+                        scrollTicking = true;
+                        requestAnimationFrame(() => {
+                            scrollTicking = false;
+                            checkAndTriggerInfiniteScroll();
+                        });
+                    };
+                    window.addEventListener('scroll', onScrollOrResize, { passive: true });
+                    window.addEventListener('resize', onScrollOrResize, { passive: true });
+                    requestAnimationFrame(checkAndTriggerInfiniteScroll);
                 }
             }
 
