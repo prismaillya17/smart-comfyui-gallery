@@ -715,11 +715,142 @@ def management_api_only(f):
     return decorated_function
 
 # --- FLASK APP INITIALIZATION ---
+from collections import OrderedDict
 app = Flask(__name__, static_folder='templates', static_url_path='/static')
 app.secret_key = SECRET_KEY
 gallery_view_cache = []
+VIEW_CACHE_MAX_ENTRIES = 32
+_view_caches = OrderedDict()
+_view_caches_lock = threading.Lock()
 folder_config_cache = None
 FFPROBE_EXECUTABLE_PATH = None
+
+_VIEW_QUERY_KEYS = (
+    'recursive', 'scope', 'ai_session_id', 'omniquery_id',
+    'search', 'workflow_files', 'workflow_prompt', 'comment_search',
+    'start_date', 'end_date', 'extension', 'prefix', 'rated_by',
+    'rating_range', 'favorites', 'no_workflow', 'no_ai_caption',
+    'sort_by', 'sort_order', 'cluster_mode', 'cluster_sort',
+    'cluster_target_id', 'cluster_scope'
+)
+
+def _norm_cache_dir(path_str):
+    if not path_str:
+        return ''
+    return os.path.normpath(str(path_str)).replace('\\', '/').lower().rstrip('/')
+
+def _make_view_cache_key(folder_key, args_multi=None):
+    src = args_multi if args_multi is not None else request.args
+    parts = [
+        str(folder_key or '_root_'),
+        str(session.get('user_id', '')),
+        str(session.get('role', '')),
+        '1' if (IS_EXHIBITION_MODE or FORCE_LOGIN) else '0',
+    ]
+    for k in _VIEW_QUERY_KEYS:
+        if hasattr(src, 'getlist'):
+            vals = [str(v).strip() for v in src.getlist(k) if str(v).strip() != '']
+        else:
+            raw_v = src.get(k)
+            if isinstance(raw_v, (list, tuple)):
+                vals = [str(v).strip() for v in raw_v if str(v).strip() != '']
+            elif raw_v is not None and str(raw_v).strip() != '':
+                vals = [str(raw_v).strip()]
+            else:
+                vals = []
+        if not vals:
+            continue
+        # Normalize default single-value parameters so omitted and explicit defaults share one cache key
+        v0_low = vals[0].lower()
+        if len(vals) == 1:
+            if k in ('recursive', 'favorites', 'no_workflow', 'no_ai_caption') and v0_low == 'false':
+                continue
+            if k == 'scope' and v0_low == 'local':
+                continue
+            if k == 'sort_by' and v0_low in ('date', 'mtime'):
+                continue
+            if k == 'sort_order' and v0_low == 'desc':
+                continue
+        if k in ('extension', 'prefix', 'rated_by', 'rating_range'):
+            vals.sort()
+        parts.append(f"{k}={'|'.join(vals)}")
+    return '&'.join(parts)
+
+def _is_default_unfiltered_date_desc_key(ckey):
+    # First 4 &-separated tokens are folder_key, user_id, role, auth_flag
+    extra = ckey.split('&')[4:]
+    return len(extra) == 0
+
+def _store_view_cache(folder_key, files_list, folder_path=None):
+    global gallery_view_cache
+    gallery_view_cache = files_list
+    ckey = _make_view_cache_key(folder_key)
+    entry = {
+        'files': files_list,
+        'folder_key': str(folder_key or '_root_'),
+        'folder_dir': _norm_cache_dir(folder_path),
+        'stale': False,
+        'ts': time.time(),
+    }
+    with _view_caches_lock:
+        _view_caches[ckey] = entry
+        _view_caches.move_to_end(ckey)
+        while len(_view_caches) > VIEW_CACHE_MAX_ENTRIES:
+            _view_caches.popitem(last=False)
+    return ckey
+
+def _mark_folder_view_caches_stale(folder_path=None):
+    target_dir = _norm_cache_dir(folder_path)
+    with _view_caches_lock:
+        for entry in _view_caches.values():
+            edir = entry.get('folder_dir') or ''
+            if not target_dir or not edir:
+                entry['stale'] = True
+            elif edir == target_dir or target_dir.startswith(edir + '/'):
+                entry['stale'] = True
+
+def _remove_ids_from_view_caches(ids_set):
+    if not ids_set:
+        return
+    global gallery_view_cache
+    gallery_view_cache = [f for f in gallery_view_cache if f.get('id') not in ids_set]
+    with _view_caches_lock:
+        for entry in _view_caches.values():
+            entry['files'] = [f for f in entry['files'] if f.get('id') not in ids_set]
+
+def _rename_id_in_view_caches(old_id, new_id, new_name, new_path):
+    global gallery_view_cache
+    for f in gallery_view_cache:
+        if f.get('id') == old_id:
+            f['id'] = new_id
+            f['name'] = new_name
+            f['path'] = new_path
+    with _view_caches_lock:
+        for entry in _view_caches.values():
+            for f in entry['files']:
+                if f.get('id') == old_id:
+                    f['id'] = new_id
+                    f['name'] = new_name
+                    f['path'] = new_path
+
+def _get_view_files_for_request():
+    folder_key = (request.args.get('folder_key') or '').strip()
+    if not folder_key:
+        return gallery_view_cache
+    ckey = _make_view_cache_key(folder_key)
+    with _view_caches_lock:
+        entry = _view_caches.get(ckey)
+        if entry is not None and not entry.get('stale'):
+            _view_caches.move_to_end(ckey)
+            return entry['files']
+    if folder_key.startswith('collection_'):
+        coll_id_raw = folder_key.split('_', 1)[1]
+        rebuilt = collection_view(coll_id_raw, _only_cache=True)
+    else:
+        rebuilt = gallery_view(folder_key, _only_cache=True)
+    if isinstance(rebuilt, list):
+        return rebuilt
+    return gallery_view_cache
 
 
 # Data structures for node categorization and analysis
@@ -3503,6 +3634,11 @@ def sync_folder_on_demand(folder_path):
                     cleanup_deleted_file_thumbnails(conn, f_info)
 
         if data_to_upsert or files_to_delete:
+            global folder_config_cache
+            folder_config_cache = None
+            if removed_ids:
+                _remove_ids_from_view_caches(set(removed_ids))
+            _mark_folder_view_caches_stale(folder_path)
             added_ids = [row[0] for row in data_to_upsert]
             yield f"data: {json.dumps({'message': 'Sync complete. Reloading...', 'status': 'reloading', 'current': total_files, 'total': total_files, 'added_ids': added_ids, 'removed_ids': removed_ids})}\n\n"
         else:
@@ -4915,9 +5051,11 @@ def process_clustering(current_files, cluster_mode, cluster_sort, cluster_target
     return result_files
 
 @app.route('/galleryout/view/<string:folder_key>')
-def gallery_view(folder_key):
+def gallery_view(folder_key, _only_cache=False):
     # 1. SECURITY LOCKDOWN CHECK
     if ADMIN_CONFIG_MISSING:
+        if _only_cache:
+            return []
         return """
         <body style="background:#0a0a0a; color:#eee; font-family:sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; text-align:center;">
             <div style="border:1px solid #dc3545; padding:40px; border-radius:16px; background:#1a1a1a; max-width:500px;">
@@ -4939,6 +5077,8 @@ def gallery_view(folder_key):
 
     if must_authenticate:
         if not is_logged_in:
+            if _only_cache:
+                return []
             return render_template('exhibition_login.html', 
                                    app_version=APP_VERSION, 
                                    enable_guest_login=ENABLE_GUEST_LOGIN if IS_EXHIBITION_MODE else False,
@@ -4948,6 +5088,8 @@ def gallery_view(folder_key):
         if is_management_side:
             user_role = session.get('role')
             if user_role not in ['ADMIN', 'MANAGER', 'STAFF']:
+                if _only_cache:
+                    return []
                 # Block GUESTs or CUSTOMERs from management interface
                 session.clear() 
                 return render_template('exhibition_login.html', 
@@ -4962,24 +5104,32 @@ def gallery_view(folder_key):
             # Extract ID part (can be 'all' or a numeric string)
             coll_id_raw = folder_key.split('_', 1)[1]
             if coll_id_raw == 'all' or coll_id_raw.isdigit():
+                if _only_cache:
+                    return collection_view(coll_id_raw, _only_cache=True)
                 # FIX: Convert MultiDict to dict with lists to preserve multi-select filters
                 args_dict = request.args.to_dict(flat=False)
                 return redirect(url_for('collection_view', coll_id=coll_id_raw, **args_dict))
         except IndexError:
-            pass
+            if _only_cache:
+                return []
 
     global gallery_view_cache
     
     # 4. EXHIBITION MODE SECURITY CHECK
     # Prevent browsing physical folders if in Exhibition mode
     if IS_EXHIBITION_MODE and folder_key != '_root_':
-        return redirect(url_for('gallery_view', folder_key='_root_'))
+        if _only_cache:
+            folder_key = '_root_'
+        else:
+            return redirect(url_for('gallery_view', folder_key='_root_'))
 
     # 5. FOLDER CONFIGURATION
     folders = get_dynamic_folder_config(force_refresh=True)
     
     # If root not found or invalid key
     if folder_key not in folders:
+        if _only_cache:
+            return []
         return redirect(url_for('gallery_view', folder_key='_root_'))
         
     current_folder_info = folders[folder_key]
@@ -5438,6 +5588,13 @@ def gallery_view(folder_key):
     cluster_scope = request.args.get('cluster_scope', 'global')
     
     gallery_view_cache = process_clustering(gallery_view_cache, cluster_mode, cluster_sort, cluster_target_id, cluster_scope, active_filters_count)
+    _store_view_cache(
+        folder_key,
+        gallery_view_cache,
+        None if (is_global_search or is_ai_search or is_omniquery or cluster_mode) else folder_path
+    )
+    if _only_cache:
+        return gallery_view_cache
 
     total_folder_files, _, _ = scan_folder_and_extract_options(folder_path, recursive=is_recursive)
     total_db_files = 0 
@@ -6288,20 +6445,30 @@ def delete_folder(folder_key):
 
 @app.route('/galleryout/api/current_view_ids')
 def get_current_view_ids():
-    """Returns all file IDs currently in the global search cache."""
+    """Returns all file IDs currently in the active view cache (or rebuilt from DB)."""
     if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
         return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
-    global gallery_view_cache
-    ids = [f['id'] for f in gallery_view_cache]
+    view_files = _get_view_files_for_request()
+    ids = [f['id'] for f in view_files]
     return jsonify({'status': 'success', 'ids': ids})
 
 @app.route('/galleryout/load_more')
 def load_more():
     if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
-        return jsonify({'files': []}), 401
-    offset = request.args.get('offset', 0, type=int)
-    if offset >= len(gallery_view_cache): return jsonify(files=[])
-    return jsonify(files=gallery_view_cache[offset:offset + PAGE_SIZE])
+        return jsonify({'files': [], 'total_files': 0, 'next_offset': 0, 'has_more': False}), 401
+    offset = max(0, request.args.get('offset', 0, type=int))
+    view_files = _get_view_files_for_request()
+    total_len = len(view_files)
+    if offset >= total_len:
+        return jsonify(files=[], total_files=total_len, next_offset=total_len, has_more=False)
+    page_files = view_files[offset:offset + PAGE_SIZE]
+    next_offset = offset + len(page_files)
+    return jsonify(
+        files=page_files,
+        total_files=total_len,
+        next_offset=next_offset,
+        has_more=(next_offset < total_len)
+    )
 
 @app.route('/galleryout/api/files_brief', methods=['POST'])
 def files_brief():
@@ -6320,7 +6487,7 @@ def files_brief():
 
     global gallery_view_cache
     if removed:
-        gallery_view_cache = [f for f in gallery_view_cache if f.get('id') not in removed]
+        _remove_ids_from_view_caches(removed)
     if not ids:
         return jsonify({'files': []})
 
@@ -6361,15 +6528,23 @@ def files_brief():
     sort_by = data.get('sort_by') or 'date'
     sort_order = data.get('sort_order') or 'desc'
     if sort_by == 'date' and str(sort_order).lower() != 'asc' and rows:
+        new_dir = _norm_cache_dir(os.path.dirname(rows[0].get('path') or ''))
         same_folder = True
         if gallery_view_cache:
-            cached_dir = os.path.normpath(os.path.dirname(gallery_view_cache[0].get('path') or '')).replace('\\', '/').lower()
-            new_dir = os.path.normpath(os.path.dirname(rows[0].get('path') or '')).replace('\\', '/').lower()
+            cached_dir = _norm_cache_dir(os.path.dirname(gallery_view_cache[0].get('path') or ''))
             same_folder = cached_dir == new_dir
         if same_folder:
             existing = {f.get('id') for f in gallery_view_cache}
             fresh = [r for r in rows if r.get('id') not in existing]
             gallery_view_cache = fresh + gallery_view_cache
+        if new_dir:
+            with _view_caches_lock:
+                for ckey, entry in _view_caches.items():
+                    if entry.get('folder_dir') == new_dir and _is_default_unfiltered_date_desc_key(ckey):
+                        existing_ids = {f.get('id') for f in entry['files']}
+                        fresh_items = [r for r in rows if r.get('id') not in existing_ids]
+                        entry['files'] = fresh_items + entry['files']
+                        entry['stale'] = False
     return jsonify({'files': rows})
 
 def get_file_info_from_db(file_id, column='*'):
@@ -6526,6 +6701,11 @@ def move_batch():
                 print(f"ERROR: Failed to move file {filename_for_error}. Reason: {e}")
                 continue
         conn.commit()
+    if moved_count > 0:
+        global folder_config_cache
+        folder_config_cache = None
+        _remove_ids_from_view_caches(set(file_ids))
+        _mark_folder_view_caches_stale(dest_path_raw)
     
     message = f"Successfully moved {moved_count} file(s)."
     if skipped_count > 0: message += f" {skipped_count} skipped (same folder)."
@@ -6674,6 +6854,9 @@ def delete_batch():
                 conn.commit()
                 for file_info in deleted_file_info:
                     cleanup_deleted_file_thumbnails(conn, file_info)
+                global folder_config_cache
+                folder_config_cache = None
+                _remove_ids_from_view_caches(set(ids_to_remove_from_db))
     
         # Costruzione messaggio finale
         action = "moved to trash" if DELETE_TO else "deleted"
@@ -6739,6 +6922,9 @@ def delete_file(file_id):
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
         conn.commit()
         cleanup_deleted_file_thumbnails(conn, dict(file_info))
+        global folder_config_cache
+        folder_config_cache = None
+        _remove_ids_from_view_caches({file_id})
         action = "moved to trash" if DELETE_TO else "deleted"
         return jsonify({'status': 'success', 'message': f'File {action} successfully.'})
 
@@ -6843,6 +7029,7 @@ def rename_file(file_id):
                             (new_id, new_path, final_new_name, file_id))
 
             conn.commit()
+            _rename_id_in_view_caches(file_id, new_id, final_new_name, new_path)
 
             return jsonify({
                 'status': 'success',
@@ -8917,7 +9104,7 @@ def tag_batch():
 
 # Updated route to accept both integer IDs and the string "all"
 @app.route('/galleryout/collection/<coll_id>')
-def collection_view(coll_id):
+def collection_view(coll_id, _only_cache=False):
     global gallery_view_cache
 
     # AUTHENTICATION CHECK FOR EXHIBITION / FORCE_LOGIN MODES
@@ -8926,6 +9113,8 @@ def collection_view(coll_id):
     must_authenticate = IS_EXHIBITION_MODE or FORCE_LOGIN
 
     if must_authenticate and not is_logged_in:
+        if _only_cache:
+            return []
         if request.headers.get('Accept') == 'application/json':
             return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
         return render_template('exhibition_login.html', 
@@ -8954,15 +9143,21 @@ def collection_view(coll_id):
                 row = conn.execute("SELECT * FROM collections WHERE id=?", (target_id,)).fetchone()
                 if row: coll_info = dict(row)
         except ValueError:
+            if _only_cache:
+                return []
             return redirect(url_for('gallery_view', folder_key='_root_'))
         
     if not coll_info: 
+        if _only_cache:
+            return []
         return redirect(url_for('gallery_view', folder_key='_root_'))
 
     # --- EXHIBITION SECURITY: Only allow PUBLIC content ---
     if IS_EXHIBITION_MODE:
         # In Exhibition mode, "all" is allowed, but specific collections must be public OR shared with the current user
         if not is_all_mode and coll_info['type'] == 'system_flag':
+            if _only_cache:
+                return []
             return redirect(url_for('gallery_view', folder_key='_root_'))
         
         if not is_all_mode and not coll_info['is_public']:
@@ -8975,6 +9170,8 @@ def collection_view(coll_id):
             shared_list = [u.strip() for u in str(coll_info.get('shared_users', '')).split(',') if u.strip()]
             
             if not is_privileged and user_id not in shared_list:
+                if _only_cache:
+                    return []
                 return redirect(url_for('gallery_view', folder_key='_root_'))
 
     # 2. Capture Filter Parameters
@@ -9419,9 +9616,10 @@ def collection_view(coll_id):
     cluster_scope = request.args.get('cluster_scope', 'global')
     
     final_files = process_clustering(final_files, cluster_mode, cluster_sort, cluster_target_id, cluster_scope, active_filters_count)
-    gallery_view_cache = final_files
-    
     fake_folder_key = f"collection_{coll_id}"
+    _store_view_cache(fake_folder_key, final_files, None)
+    if _only_cache:
+        return final_files
 
     # Fetch notes dynamically for the current collection
     has_notes = False
